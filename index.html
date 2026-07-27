@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SimpleDraw</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Top Toolbar -->
+        <header class="topbar">
+            <div class="topbar-section file-tools">
+                <button id="btn-new" class="icon-btn" title="Nuevo Documento">📄</button>
+                <button id="btn-open" class="icon-btn" title="Abrir (Nativo)">📂</button>
+                <input type="file" id="file-open-input" accept=".json" style="display: none;">
+                <button id="btn-save" class="icon-btn" title="Guardar (Nativo)">💾</button>
+                <button id="btn-doc-settings" class="icon-btn" title="Ajustes de Documento">📋</button>
+            </div>
+
+            <div class="topbar-separator"></div>
+
+            <div class="topbar-section print-tools">
+                <button id="btn-add-page" class="icon-btn" title="Añadir Página (Layout)"><span style="display:inline-flex; align-items:center; justify-content:center; width:14px; height:18px; background:white; color:black; font-weight:bold; font-size:14px; border:1px solid #888; border-radius:2px; line-height:1;">+</span></button>
+                <button id="btn-print" class="icon-btn" title="Imprimir / Exportar a PDF">🖨️</button>
+            </div>
+
+            <div class="topbar-separator"></div>
+
+            <div class="topbar-section draw-tools">
+                <button id="tool-select" class="icon-btn tool-btn active" data-tool="select" title="Seleccionar">👆</button>
+                <button id="tool-move" class="icon-btn tool-btn" data-tool="move" title="Mover / Copiar">✥</button>
+                <button id="tool-polyline" class="icon-btn tool-btn" data-tool="polyline" title="Polilínea">📏</button>
+                <button id="tool-label" class="icon-btn tool-btn" data-tool="label" title="Etiqueta">T</button>
+            </div>
+
+            <div class="topbar-separator"></div>
+
+            <div class="topbar-section aids-tools">
+                <button id="btn-zoom-ext" class="icon-btn" title="Zoom Extensión">🔍</button>
+                <label class="icon-toggle" title="Endpoint Snap">
+                    <input type="checkbox" id="toggle-snap" checked>
+                    <span class="icon">🧲</span>
+                </label>
+                <label class="icon-toggle" title="Ortho">
+                    <input type="checkbox" id="toggle-ortho">
+                    <span class="icon">➕</span>
+                </label>
+                <input type="number" id="ortho-angle" value="90" title="Ángulo Ortho (grados)" class="angle-input" min="1" max="180">
+            </div>
+            
+            <div class="logo-top">SimpleDraw</div>
+        </header>
+
+        <div class="main-area">
+            <!-- Sidebar / Properties -->
+            <aside class="sidebar">
+                <div class="panel layers-panel">
+                    <h3>Capas</h3>
+                    <div class="add-layer-controls" style="display: flex; gap: 5px; margin-bottom: 10px;">
+                        <input type="text" id="new-layer-input" placeholder="Nueva capa..." style="flex: 1; padding: 4px; background: var(--bg-main); color: var(--text-main); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem;">
+                        <button id="btn-add-layer" class="btn primary" style="width: auto; padding: 4px 12px; margin: 0; font-size: 1.1rem; line-height: 1;">+</button>
+                    </div>
+                    <div id="layers-list">
+                        <!-- Las capas se inyectarán aquí dinámicamente -->
+                        <div class="layer-item active" data-layer="0">
+                            <span class="layer-color" style="background: #ffffff;"></span>
+                            <span class="layer-name">0 (Por defecto)</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel" id="properties-panel" style="display: none; border-top: 1px solid var(--border);">
+                    <h3>Propiedades</h3>
+                    <div class="property-item">
+                        <label>Objeto:</label>
+                        <span id="prop-type">-</span>
+                    </div>
+                    <div class="property-item" id="prop-layer-container">
+                        <label>Capa:</label>
+                        <select id="prop-layer"></select>
+                    </div>
+                    <div class="property-item" id="prop-length-container">
+                        <label>Longitud:</label>
+                        <span id="prop-length">-</span>
+                    </div>
+                    <div class="property-item" id="prop-lbl-size-container" style="display: none;">
+                        <label>Tamaño (mm):</label>
+                        <input type="number" id="prop-lbl-size" step="1" value="5" style="width:60px; background:var(--input-bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
+                    </div>
+                    <div class="property-item" id="prop-lbl-prec-container" style="display: none;">
+                        <label>Precisión (dec):</label>
+                        <input type="number" id="prop-lbl-prec" step="1" min="0" max="10" placeholder="Doc" style="width:60px; background:var(--input-bg); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:2px 5px;">
+                    </div>
+                    <div class="property-item" id="prop-page-container" style="display: none; justify-content: center; margin-top: 10px;">
+                        <button id="btn-edit-page" class="btn primary" style="width: 100%;">⚙️ Configurar Página</button>
+                    </div>
+                    <button id="btn-delete" class="btn primary" style="background-color: #d9534f; margin-top: 10px; width: 100%;">Borrar (Papelera)</button>
+                </div>
+            </aside>
+
+            <!-- Canvas Area -->
+            <main class="canvas-container">
+                <button id="btn-settings" class="icon-btn" title="Ajustes de Lienzo" style="position: absolute; top: 10px; left: 10px; z-index: 50; background: rgba(54, 54, 68, 0.8);">⚙️</button>
+                <div id="settings-panel" class="panel" style="display: none; position: absolute; top: 50px; left: 10px; z-index: 50; background: rgba(54, 54, 68, 0.95); border: 1px solid var(--border); border-radius: 8px; width: 250px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+                    <h3 style="margin-bottom: 15px;">Espacio de Trabajo</h3>
+                    
+                    <div class="property-item">
+                        <label>Color Fondo:</label>
+                        <input type="color" id="set-bg-color" value="#121214" style="width: 50px; padding: 0; cursor: pointer;">
+                    </div>
+                    
+                    <div class="property-item" style="margin-top: 15px;">
+                        <label>Retícula:</label>
+                        <label class="icon-toggle" title="Activar/Desactivar Retícula">
+                            <input type="checkbox" id="set-grid-enable">
+                            <span class="icon">#️⃣</span>
+                        </label>
+                    </div>
+                    
+                    <div id="grid-settings" style="display: none; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 5px;">
+                        <div class="property-item">
+                            <label>Tipo:</label>
+                            <select id="set-grid-type">
+                                <option value="absolute">Absoluta (Snap)</option>
+                                <option value="relative">Relativa (Óptica)</option>
+                            </select>
+                        </div>
+                        <div class="property-item">
+                            <label>Color Grid:</label>
+                            <input type="color" id="set-grid-color" value="#333333" style="width: 50px; padding: 0; cursor: pointer;">
+                        </div>
+                        <div class="property-item">
+                            <label>Dimensión X:</label>
+                            <input type="number" id="set-grid-x" value="100" min="1" style="width: 60px;">
+                        </div>
+                        <div class="property-item">
+                            <label>Dimensión Y:</label>
+                            <input type="number" id="set-grid-y" value="100" min="1" style="width: 60px;">
+                        </div>
+                        <div class="property-item">
+                            <label>Ángulo:</label>
+                            <input type="number" id="set-grid-angle" value="0" style="width: 60px;">
+                        </div>
+                    </div>
+                </div>
+
+                <canvas id="drawing-canvas"></canvas>
+                <div id="coordinates-bar">X: 0.00, Y: 0.00</div>
+                <div id="length-input-overlay" style="display: none;">
+                    <label>Longitud:</label>
+                    <input type="text" id="length-input" readonly>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Document Settings Modal -->
+    <div id="doc-modal" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-panel); padding: 20px; border-radius: 8px; width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+            <h3 style="margin-bottom: 15px;">Ajustes del Documento</h3>
+            
+            <div class="property-item"><label>Unidades:</label>
+                <select id="doc-units"><option value="cm">cm</option><option value="m">m</option><option value="mm">mm</option></select>
+            </div>
+            <div class="property-item"><label>Precisión global (dec):</label><input type="number" id="doc-precision" value="2" min="0" max="10" step="1"></div>
+            <div class="property-item"><label>Nº Proyecto:</label><input type="text" id="doc-proj-num"></div>
+            <div class="property-item"><label>Proyecto:</label><input type="text" id="doc-project"></div>
+            <div class="property-item"><label>Nombre (Archivo):</label><input type="text" id="doc-name"></div>
+            <div class="property-item"><label>Dibujante:</label><input type="text" id="doc-draftsman"></div>
+            <div class="property-item"><label>Dirección:</label><input type="text" id="doc-address"></div>
+            <div class="property-item"><label>Comentarios:</label><input type="text" id="doc-comments"></div>
+            
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px;">
+                <button id="doc-modal-cancel" class="btn" style="width: auto; background: var(--bg-main); color: var(--text-main);">Cancelar</button>
+                <button id="doc-modal-confirm" class="btn primary" style="width: auto;">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Page Settings Modal -->
+    <div id="page-modal" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-panel); padding: 20px; border-radius: 8px; width: 400px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); max-height: 90vh; overflow-y: auto;">
+            <h3 style="margin-bottom: 15px;">Ajustes de Página</h3>
+            
+            <div class="property-item"><label>Nombre:</label><input type="text" id="page-name"></div>
+            <div class="property-item"><label>Formato:</label>
+                <select id="page-format">
+                    <option value="A4">A4 (210x297)</option>
+                    <option value="A3">A3 (297x420)</option>
+                    <option value="A2">A2 (420x594)</option>
+                    <option value="A1">A1 (594x841)</option>
+                    <option value="A0">A0 (841x1189)</option>
+                </select>
+            </div>
+            <div class="property-item"><label>Orientación:</label>
+                <select id="page-orient"><option value="landscape">Horizontal</option><option value="portrait">Vertical</option></select>
+            </div>
+            <div class="property-item"><label>Escala (1:X):</label>
+                <select id="page-scale">
+                    <option value="1">1:1</option>
+                    <option value="2">1:2</option>
+                    <option value="5">1:5</option>
+                    <option value="10">1:10</option>
+                    <option value="20">1:20</option>
+                    <option value="50">1:50</option>
+                    <option value="100">1:100</option>
+                    <option value="200">1:200</option>
+                    <option value="500">1:500</option>
+                    <option value="1000">1:1000</option>
+                    <option value="custom">Personalizado / Fit</option>
+                </select>
+            </div>
+            <div class="property-item"><label>Valor Custom:</label><input type="number" id="page-scale-custom" value="100" min="0.1"></div>
+            
+            <div class="property-item"><label>Color Fondo:</label><div style="display:flex; gap:5px;"><input type="color" id="page-bgcolor" value="#ffffff"><input type="checkbox" id="page-show-bg" checked title="Mostrar Fondo"></div></div>
+            <div class="property-item"><label>Color Borde:</label><div style="display:flex; gap:5px;"><input type="color" id="page-border-color" value="#000000"><input type="checkbox" id="page-show-border" checked title="Mostrar Borde Exterior"></div></div>
+            
+            <div class="property-item"><label>Punto Anclaje:</label>
+                <select id="page-anchor">
+                    <option value="tl">Top-Left</option>
+                    <option value="tc">Top-Center</option>
+                    <option value="tr">Top-Right</option>
+                    <option value="ml">Mid-Left</option>
+                    <option value="mc">Center</option>
+                    <option value="mr">Mid-Right</option>
+                    <option value="bl">Bot-Left</option>
+                    <option value="bc">Bot-Center</option>
+                    <option value="br">Bot-Right</option>
+                </select>
+            </div>
+
+            <h4 style="margin: 15px 0 5px 0; font-size: 0.85rem; color: var(--text-muted);">Márgenes (mm)</h4>
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 10px; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 4px;">
+                <!-- Superior -->
+                <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+                    <label style="font-size: 0.75rem;">Superior</label>
+                    <div style="display:flex; gap:5px;"><input type="number" id="page-margin-t-val" value="5" style="width: 50px;"><input type="checkbox" id="page-margin-t-show" checked title="Dibujar Línea"></div>
+                </div>
+                <!-- Medio: Izquierda y Derecha -->
+                <div style="display: flex; justify-content: space-between; width: 100%;">
+                    <div style="display: flex; flex-direction: column; align-items: flex-start; gap: 2px;">
+                        <label style="font-size: 0.75rem;">Izquierdo</label>
+                        <div style="display:flex; gap:5px;"><input type="checkbox" id="page-margin-l-show" checked title="Dibujar Línea"><input type="number" id="page-margin-l-val" value="5" style="width: 50px;"></div>
+                    </div>
+                    <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 2px;">
+                        <label style="font-size: 0.75rem;">Derecho</label>
+                        <div style="display:flex; gap:5px;"><input type="number" id="page-margin-r-val" value="5" style="width: 50px;"><input type="checkbox" id="page-margin-r-show" checked title="Dibujar Línea"></div>
+                    </div>
+                </div>
+                <!-- Inferior -->
+                <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+                    <div style="display:flex; gap:5px;"><input type="number" id="page-margin-b-val" value="10" style="width: 50px;"><input type="checkbox" id="page-margin-b-show" checked title="Dibujar Línea"></div>
+                    <label style="font-size: 0.75rem;">Inferior</label>
+                </div>
+            </div>
+
+            <div class="property-group">
+            <h3>Pie de Página</h3>
+            <div style="font-size:11px; color:#aaa; margin-bottom: 8px;">
+                <strong>Doc:</strong> #doc-unidades#, #doc-numero#, #doc-proyecto#, #doc-nombre#, #doc-dibujante#, #doc-direccion#, #doc-comentario#<br>
+                <strong>Pag:</strong> #pag-nombre#, #pag-formato#, #pag-orientacion#, #pag-escala#, #pag-numero#<br>
+                <strong>Sys:</strong> #fecha#, #fecha_corta#
+            </div>
+            <div class="property-item"><label>Izquierda:</label><input type="text" id="page-foot-l"></div>
+            <div class="property-item"><label>Centro:</label><input type="text" id="page-foot-c"></div>
+            <div class="property-item"><label>Derecha:</label><input type="text" id="page-foot-r"></div>
+        </div>
+            
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px;">
+                <button id="page-modal-cancel" class="btn" style="width: auto; background: var(--bg-main); color: var(--text-main);">Cancelar</button>
+                <button id="page-modal-confirm" class="btn primary" style="width: auto;">Guardar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Print Modal -->
+    <div id="print-modal" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-panel); padding: 20px; border-radius: 8px; width: 350px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+            <h3 style="margin-bottom: 15px;">Imprimir a PDF</h3>
+            
+            <div class="property-item"><label>Páginas:</label>
+                <select id="print-selection"><option value="all">Todas</option><option value="selected">Solo Seleccionada</option></select>
+            </div>
+            <div class="property-item"><label>Color:</label>
+                <select id="print-color"><option value="color">Color</option><option value="bw">Blanco y Negro</option></select>
+            </div>
+            <div class="property-item"><label>Formato Salida:</label>
+                <select id="print-mode"><option value="single">Un solo PDF (Multipágina)</option><option value="multiple">Varios PDFs</option></select>
+            </div>
+            <div class="property-item" style="flex-direction: column; align-items: flex-start; gap: 5px;">
+                <label>Nombre de archivo (soporta variables):</label>
+                <input type="text" id="print-filename" value="#doc-proyecto#_#pag-nombre#_#fecha_corta#_#pag-numero#" placeholder="Ej. #doc-proyecto#_#pag-nombre#_#fecha_corta#" style="width: 100%;">
+            </div>
+            
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px;">
+                <button id="print-modal-cancel" class="btn" style="width: auto; background: var(--bg-main); color: var(--text-main);">Cancelar</button>
+                <button id="print-modal-confirm" class="btn primary" style="width: auto;">Generar PDF</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Layer Delete Modal -->
+    <div id="layer-modal" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: var(--bg-panel); padding: 20px; border-radius: 8px; width: 320px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);">
+            <h3 style="margin-bottom: 10px;">Borrar Capa</h3>
+            <p id="layer-modal-msg" style="font-size: 0.9rem; margin-bottom: 15px; color: var(--text-muted);"></p>
+            <div style="margin-bottom: 15px;">
+                <label style="display:block; margin-bottom: 5px; font-size: 0.85rem;">Capa destino:</label>
+                <div style="display: flex; gap: 5px; align-items: center;">
+                    <input type="text" id="layer-modal-input" value="0" style="flex: 1; padding: 6px; background: var(--bg-main); color: #00ff00; border: 1px solid var(--border); border-radius: 4px; font-weight: bold;">
+                    <select id="layer-modal-select" style="flex: 1; padding: 6px; background: var(--bg-main); color: var(--text-main); border: 1px solid var(--border); border-radius: 4px;"></select>
+                </div>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                <button id="layer-modal-cancel" class="btn" style="width: auto; background: var(--bg-main); color: var(--text-main);">Cancelar</button>
+                <button id="layer-modal-confirm" class="btn primary" style="width: auto;">Aceptar</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- jspdf -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
