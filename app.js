@@ -1,3 +1,4 @@
+var isOracleActive = false;
 const canvas = document.getElementById('drawing-canvas');
 const ctx = canvas.getContext('2d');
 const coordBar = document.getElementById('coordinates-bar');
@@ -11,7 +12,8 @@ let layers = {
 };
 let currentLayer = '0';
 let currentTool = 'select';
-let selectedObject = null;
+let selectedObjects = [];
+let clipboard = [];
 let typedLength = '';
 
 // Document & Pages
@@ -19,13 +21,125 @@ let documentSettings = {
     units: 'cm', projNum: '', projectName: '', fileName: 'Nuevo_Dibujo', draftsman: '', address: '', comments: '', lblPrecision: 2
 };
 let pages = [];
-let selectedPageIdx = -1;
 
 // Workspace Settings
 let workspaceSettings = {
     bgColor: '#fdfbf7',
     grid: { enabled: true, type: 'absolute', color: '#ffd6d6', sizeX: 100, sizeY: 100, angle: 0 }
 };
+
+// Time Map Engine
+let timeMap = {
+    nodes: {},
+    activeNodeId: null,
+    counter: 0
+};
+let isTimeMapEnabled = true;
+
+function commitTimeMap(message, tag = null) {
+    if (!isTimeMapEnabled) return;
+    
+    const state = {
+        polylines: structuredClone(polylines),
+        labels: structuredClone(labels),
+        pages: structuredClone(pages),
+        layers: structuredClone(layers),
+        workspaceSettings: structuredClone(workspaceSettings),
+        documentSettings: structuredClone(documentSettings),
+        currentLayer: currentLayer
+    };
+    
+    timeMap.counter++;
+    const nodeId = "commit_" + timeMap.counter;
+    const parentId = timeMap.activeNodeId;
+    
+let hue = 200;
+    if (parentId && timeMap.nodes[parentId]) {
+        const parent = timeMap.nodes[parentId];
+        const childIndex = parent.childrenIds.length;
+        if (childIndex === 0) {
+            hue = parent.hue !== undefined ? parent.hue : 200;
+        } else {
+            hue = ((parent.hue !== undefined ? parent.hue : 200) + (45 * childIndex)) % 360;
+        }
+    }
+    
+    const node = {
+        id: nodeId,
+        parentId: parentId,
+        childrenIds: [],
+        state: state,
+        message: message,
+        tag: tag,
+        hue: hue,
+        timestamp: Date.now()
+    };
+    
+    timeMap.nodes[nodeId] = node;
+    if (parentId && timeMap.nodes[parentId]) {
+        timeMap.nodes[parentId].childrenIds.push(nodeId);
+    }
+    timeMap.activeNodeId = nodeId;
+    console.log("TimeMap Commit:", message, tag || "");
+    if (window.renderTimeMapSVG) window.renderTimeMapSVG();
+}
+
+function checkoutNode(nodeId) {
+    if (!timeMap.nodes[nodeId]) return;
+    const node = timeMap.nodes[nodeId];
+    
+    const s = node.state;
+    polylines = structuredClone(s.polylines);
+    labels = structuredClone(s.labels);
+    pages = structuredClone(s.pages);
+    layers = structuredClone(s.layers);
+    workspaceSettings = structuredClone(s.workspaceSettings);
+    documentSettings = structuredClone(s.documentSettings);
+    
+    if (s.currentLayer && layers[s.currentLayer]) {
+        currentLayer = s.currentLayer;
+    } else {
+        if (!layers[currentLayer]) {
+            const available = Object.keys(layers);
+            currentLayer = available.length > 0 ? available[0] : '0';
+            if (!layers['0'] && available.length === 0) {
+                layers['0'] = { color: '#ffffff', visible: true };
+                currentLayer = '0';
+            }
+        }
+    }
+    
+    timeMap.activeNodeId = nodeId;
+    
+    selectedObjects = [];
+    currentPolyline = null;
+    moveState = 'NONE';
+    rotateState = 'NONE';
+    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+    const selBtn = document.querySelector('.tool-btn[data-tool="select"]');
+    if (selBtn) selBtn.classList.add('active');
+    currentTool = 'select';
+    
+    updateLayersUI();
+    if (typeof updateSettingsUI === 'function') updateSettingsUI();
+    updatePropertiesPanel();
+    draw();
+    
+    console.log("TimeMap Checkout:", node.message);
+    if (window.renderTimeMapSVG) window.renderTimeMapSVG();
+}
+
+function tagCurrentNode(tag) {
+    if (timeMap.activeNodeId && timeMap.nodes[timeMap.activeNodeId]) {
+        timeMap.nodes[timeMap.activeNodeId].tag = tag;
+        console.log("TimeMap Tagged:", tag);
+    }
+}
+
+function resetTimeMap(initialMessage = "Dibujo inicial") {
+    timeMap = { nodes: {}, activeNodeId: null, counter: 0 };
+    commitTimeMap(initialMessage);
+}
 
 // Camera/View state
 let panX = 0;
@@ -34,6 +148,8 @@ let scale = 1;
 
 // Drawing state
 let currentPolyline = null;
+let polylineMode = 'line';
+let currentPreviewBulge = 0;
 let mouseX = 0;
 let mouseY = 0;
 let worldX = 0;
@@ -48,9 +164,18 @@ let moveSelection = [];
 let moveState = 'NONE'; // SELECTING, ORIGIN, DESTINATION, ADJUSTING
 let moveOrigin = null;
 let moveDest = null;
-let isCopyMode = false;
-let moveModifier = '';
 let moveCommandInput = '';
+let moveModifier = ''; // for modifiers like 'C'
+
+let rotateState = 'NONE'; // SELECTING, ORIGIN, REFERENCE, ANGLE
+let rotateOrigin = null;
+let rotateReference = null;
+let rotateTargetPoint = null;
+let rotateSelection = [];
+let rotateCommandInput = '';
+let rotateModifier = '';
+
+let isCopyMode = false;
 
 // UI Elements - Topbar
 const btnNew = document.getElementById('btn-new');
@@ -233,13 +358,7 @@ document.getElementById('print-modal-confirm').addEventListener('click', async (
 
 // Zoom Extension
 btnZoomExt.addEventListener('click', () => {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    polylines.forEach(pl => {
-        pl.points.forEach(p => {
-            if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
-        });
-    });
+    let { minX, minY, maxX, maxY } = computeBounds(polylines);
     pages.forEach(p => {
         const dim = getPageWorldDimensions(p);
         const tl = getPageTopLeft(p);
@@ -301,13 +420,7 @@ function getPageTopLeft(page) {
 }
 
 btnAddPage.addEventListener('click', () => {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    polylines.forEach(pl => {
-        pl.points.forEach(p => {
-            if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
-        });
-    });
+    let { minX, minY, maxX, maxY } = computeBounds(polylines);
     
     let targetW = (maxX === -Infinity) ? 100 : (maxX - minX);
     let targetH = (maxY === -Infinity) ? 100 : (maxY - minY);
@@ -360,8 +473,8 @@ btnAddPage.addEventListener('click', () => {
         footC: 'Escala 1:#pag-escala#',
         footR: 'Pág. #pag-numero#'
     });
-    selectedPageIdx = pages.length - 1;
     draw();
+    commitTimeMap('Página creada');
 });
 
 // Settings Logic
@@ -408,8 +521,7 @@ btnNew.addEventListener('click', () => {
         };
         documentSettings = { units: 'cm', projNum: '', projectName: '', fileName: 'Nuevo_Dibujo', draftsman: '', address: '', comments: '' };
         currentLayer = '0';
-        selectedObject = null;
-        selectedPageIdx = -1;
+        selectedObjects = [];
         currentPolyline = null;
         panX = 0;
         panY = 0;
@@ -418,11 +530,12 @@ btnNew.addEventListener('click', () => {
         updateSettingsUI();
         updatePropertiesPanel();
         draw();
+        resetTimeMap('Nuevo Dibujo');
     }
 });
 
 btnSave.addEventListener('click', () => {
-    const data = { polylines, labels, layers, workspaceSettings, documentSettings, pages };
+    const data = { polylines, labels, layers, workspaceSettings, documentSettings, pages, timeMap };
     const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -458,13 +571,19 @@ fileOpenInput.addEventListener('change', (e) => {
                 if (!layers['0']) layers['0'] = { color: '#ffffff', visible: true };
                 if (!layers['basura']) layers['basura'] = { color: '#888888', visible: false };
                 
-                selectedObject = null;
-                selectedPageIdx = -1;
+                selectedObjects = [];
                 currentPolyline = null;
                 updateLayersUI();
                 updateSettingsUI();
                 updatePropertiesPanel();
                 fitToScreen();
+                if (data.timeMap) {
+                    timeMap = data.timeMap;
+                    assignHuesToGraph();
+                    console.log("TimeMap cargado desde archivo con " + Object.keys(timeMap.nodes).length + " nodos.");
+                } else {
+                    resetTimeMap('Archivo cargado');
+                }
             } else {
                 alert('El archivo no tiene un formato válido.');
             }
@@ -488,7 +607,14 @@ resizeCanvas();
 
 function screenToWorld(sx, sy) { return { x: (sx - panX) / scale, y: -(sy - panY) / scale }; }
 function worldToScreen(wx, wy) { return { x: (wx * scale) + panX, y: (-wy * scale) + panY }; }
-function rotatePoint(x, y, rad) { return { x: x * Math.cos(rad) - y * Math.sin(rad), y: x * Math.sin(rad) + y * Math.cos(rad) }; }
+function rotatePoint(x, y, rad, cx = 0, cy = 0) { 
+    const dx = x - cx;
+    const dy = y - cy;
+    return { 
+        x: cx + dx * Math.cos(rad) - dy * Math.sin(rad), 
+        y: cy + dx * Math.sin(rad) + dy * Math.cos(rad) 
+    }; 
+}
 
 function generateColor(seed) {
     let hash = 0;
@@ -520,6 +646,32 @@ function updateLayersUI() {
             ${deleteBtnHTML}
         `;
         
+        const nameSpan = div.querySelector('.layer-name');
+        if (layerName !== '0' && layerName !== 'basura') {
+            nameSpan.style.cursor = 'text';
+            nameSpan.title = "Doble clic para renombrar";
+            nameSpan.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                const newName = prompt("Nuevo nombre para la capa:", layerName);
+                if (newName && newName.trim() !== '' && newName.trim() !== layerName) {
+                    const finalName = newName.trim();
+                    if (layers[finalName]) {
+                        alert("Ya existe una capa con ese nombre.");
+                        return;
+                    }
+                    layers[finalName] = layers[layerName];
+                    delete layers[layerName];
+                    polylines.forEach(pl => { if (pl.layer === layerName) pl.layer = finalName; });
+                    labels.forEach(lbl => { if (lbl.layer === layerName) lbl.layer = finalName; });
+                    if (currentLayer === layerName) currentLayer = finalName;
+                    updateLayersUI();
+                    updatePropertiesPanel();
+                    draw();
+                    commitTimeMap('Capa renombrada');
+                }
+            });
+        }
+        
         div.querySelector('.layer-vis').addEventListener('click', (e) => {
             e.stopPropagation(); layers[layerName].visible = !layers[layerName].visible; updateLayersUI(); draw();
         });
@@ -543,12 +695,9 @@ function updateLayersUI() {
         propLayer.appendChild(opt);
     }
     
-    if (selectedObject) {
-        if (selectedObject.type === 'polyline' && polylines[selectedObject.plIndex]) {
-            propLayer.value = polylines[selectedObject.plIndex].layer;
-        } else if (selectedObject.type === 'label' && labels[selectedObject.index]) {
-            propLayer.value = labels[selectedObject.index].layer || '0';
-        }
+    if (selectedObjects && selectedObjects.length > 0) {
+        // Just call updatePropertiesPanel to re-evaluate what to show
+        updatePropertiesPanel();
     }
 }
 
@@ -612,17 +761,12 @@ btnAddLayer.addEventListener('click', () => {
     newLayerInput.value = '';
     currentLayer = name;
     updateLayersUI();
+    commitTimeMap('Capa creada');
 });
 
 function fitToScreen() {
     if (polylines.length === 0) return;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    polylines.forEach(pl => {
-        pl.points.forEach(p => {
-            if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-            if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
-        });
-    });
+    let { minX, minY, maxX, maxY } = computeBounds(polylines);
     const width = maxX - minX; const height = maxY - minY;
     if (width === 0 && height === 0) return;
     const scaleX = canvas.width / (width * 1.2); const scaleY = canvas.height / (height * 1.2);
@@ -638,21 +782,143 @@ document.querySelectorAll('.tool-btn').forEach(btn => {
         document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
         e.currentTarget.classList.add('active');
         currentTool = e.currentTarget.dataset.tool;
+        
+        selectedObjects = [];
+        updatePropertiesPanel();
+        
         currentPolyline = null;
+        polylineMode = 'line';
+        currentPreviewBulge = 0;
         typedLength = '';
         lengthInputOverlay.style.display = 'none';
         
         moveState = (currentTool === 'move') ? 'SELECTING' : 'NONE';
         moveSelection = [];
-        moveOrigin = null; moveDest = null; moveModifier = ''; moveCommandInput = ''; isCopyMode = false;
+        moveOrigin = null; moveDest = null; moveModifier = ''; moveCommandInput = ''; 
+        
+        rotateState = (currentTool === 'rotate') ? 'SELECTING' : 'NONE';
+        rotateSelection = [];
+        rotateOrigin = null; rotateReference = null; rotateModifier = ''; rotateCommandInput = '';
+        
+        isCopyMode = false;
         
         if (currentTool === 'select' || currentTool === 'label') canvas.style.cursor = 'default';
         else if (currentTool === 'polyline') canvas.style.cursor = 'none';
-        else if (currentTool === 'move') canvas.style.cursor = 'crosshair';
+        else if (currentTool === 'move' || currentTool === 'rotate') canvas.style.cursor = 'crosshair';
         draw();
     });
 });
 canvas.style.cursor = 'default';
+
+// Arc Math Helpers
+function computeBounds(polys) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    polys.forEach(pl => {
+        for (let i = 0; i < pl.points.length; i++) {
+            const p1 = pl.points[i];
+            if (p1.x < minX) minX = p1.x; if (p1.y < minY) minY = p1.y;
+            if (p1.x > maxX) maxX = p1.x; if (p1.y > maxY) maxY = p1.y;
+
+            if (p1.bulge && p1.bulge !== 0) {
+                let nextIdx = i + 1;
+                if (nextIdx === pl.points.length) {
+                    if (pl.closed) nextIdx = 0;
+                    else continue;
+                }
+                const p2 = pl.points[nextIdx];
+                const arc = getArcParams(p1, p2, p1.bulge);
+                if (arc) {
+                    const samples = 12;
+                    let angStart = arc.startAngle;
+                    let angEnd = arc.endAngle;
+                    if (arc.ccw && angEnd < angStart) angEnd += 2 * Math.PI;
+                    if (!arc.ccw && angEnd > angStart) angEnd -= 2 * Math.PI;
+                    const step = (angEnd - angStart) / samples;
+                    for (let j = 1; j < samples; j++) {
+                        const a = angStart + step * j;
+                        const px = arc.cx + arc.R * Math.cos(a);
+                        const py = arc.cy + arc.R * Math.sin(a);
+                        if (px < minX) minX = px; if (py < minY) minY = py;
+                        if (px > maxX) maxX = px; if (py > maxY) maxY = py;
+                    }
+                }
+            }
+        }
+    });
+    return { minX, minY, maxX, maxY };
+}
+
+function getArcParams(p1, p2, bulge) {
+    if (!bulge || bulge === 0) return null;
+    const L = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    if (L === 0) return null;
+    const mx = (p1.x + p2.x) / 2;
+    const my = (p1.y + p2.y) / 2;
+    const a = (L / 2) * ((1 - bulge * bulge) / (2 * bulge));
+    const cx = mx - a * (p2.y - p1.y) / L;
+    const cy = my + a * (p2.x - p1.x) / L;
+    const R = Math.hypot(p1.x - cx, p1.y - cy);
+    const startAngle = Math.atan2(p1.y - cy, p1.x - cx);
+    const endAngle = Math.atan2(p2.y - cy, p2.x - cx);
+    const ccw = bulge > 0;
+    return { cx, cy, R, startAngle, endAngle, ccw };
+}
+
+function isPointInArcSpan(x, y, arcParams) {
+    const { cx, cy, startAngle, endAngle, ccw } = arcParams;
+    let angle = Math.atan2(y - cy, x - cx);
+    let diff = angle - startAngle;
+    while(diff < -Math.PI) diff += 2*Math.PI;
+    while(diff > Math.PI) diff -= 2*Math.PI;
+    
+    let span = endAngle - startAngle;
+    while(span <= -Math.PI) span += 2*Math.PI;
+    while(span > Math.PI) span -= 2*Math.PI;
+    if (ccw && span < 0) span += 2*Math.PI;
+    if (!ccw && span > 0) span -= 2*Math.PI;
+    
+    if (ccw) {
+        return (diff >= -1e-5 && diff <= span + 1e-5);
+    } else {
+        return (diff <= 1e-5 && diff >= span - 1e-5);
+    }
+}
+
+function distToArc(x, y, arcParams) {
+    if (!arcParams) return Infinity;
+    const { cx, cy, R, startAngle, endAngle } = arcParams;
+    const distToCenter = Math.hypot(x - cx, y - cy);
+    
+    if (isPointInArcSpan(x, y, arcParams)) {
+        return Math.abs(distToCenter - R);
+    }
+    
+    const p1x = cx + R * Math.cos(startAngle);
+    const p1y = cy + R * Math.sin(startAngle);
+    const p2x = cx + R * Math.cos(endAngle);
+    const p2y = cy + R * Math.sin(endAngle);
+    return Math.min(Math.hypot(x - p1x, y - p1y), Math.hypot(x - p2x, y - p2y));
+}
+
+function getArcMidpoint(arcParams) {
+    if (!arcParams) return null;
+    const { cx, cy, R, startAngle, endAngle, ccw } = arcParams;
+    let span = endAngle - startAngle;
+    while(span <= -Math.PI) span += 2*Math.PI;
+    while(span > Math.PI) span -= 2*Math.PI;
+    if (ccw && span < 0) span += 2*Math.PI;
+    if (!ccw && span > 0) span -= 2*Math.PI;
+    const midAngle = startAngle + span / 2;
+    return { x: cx + R * Math.cos(midAngle), y: cy + R * Math.sin(midAngle) };
+}
+
+function distToPolylineSegment(wx, wy, p1, p2, bulge) {
+    if (bulge && bulge !== 0) {
+        const params = getArcParams(p1, p2, bulge);
+        if (params) return distToArc(wx, wy, params);
+    }
+    return distToSegment(wx, wy, p1.x, p1.y, p2.x, p2.y);
+}
 
 function distToSegment(x, y, x1, y1, x2, y2) {
     const A = x - x1; const B = y - y1; const C = x2 - x1; const D = y2 - y1;
@@ -663,6 +929,45 @@ function distToSegment(x, y, x1, y1, x2, y2) {
     else if (param > 1) { xx = x2; yy = y2; }
     else { xx = x1 + param * C; yy = y1 + param * D; }
     return Math.hypot(x - xx, y - yy);
+}
+
+function getClosestGrip(wx, wy) {
+    if (!selectedObjects.some(o => o.type === 'polyline')) return null;
+    const pl = polylines[(selectedObjects.find(o => o.type === 'polyline') || {}).plIndex];
+    if (!pl) return null;
+    
+    let closestDist = 15 / scale;
+    let closestGrip = null;
+    
+    for (let j = 0; j < pl.points.length; j++) {
+        const p = pl.points[j];
+        const dist = Math.hypot(p.x - wx, p.y - wy);
+        if (dist < closestDist) {
+            closestDist = dist;
+            closestGrip = { type: 'vertex', index: j };
+        }
+        
+        let nextIdx = j + 1;
+        if (nextIdx === pl.points.length) {
+            if (pl.closed && pl.points.length > 2) nextIdx = 0;
+            else continue;
+        }
+        const p1 = pl.points[j]; const p2 = pl.points[nextIdx];
+        let midW;
+        if (p1.bulge && p1.bulge !== 0) {
+            const params = getArcParams(p1, p2, p1.bulge);
+            if (params) midW = getArcMidpoint(params);
+            else midW = { x: (p1.x + p2.x)/2, y: (p1.y + p2.y)/2 };
+        } else {
+            midW = { x: (p1.x + p2.x)/2, y: (p1.y + p2.y)/2 };
+        }
+        const distMid = Math.hypot(midW.x - wx, midW.y - wy);
+        if (distMid < closestDist) {
+            closestDist = distMid;
+            closestGrip = { type: 'midpoint', index: j };
+        }
+    }
+    return closestGrip;
 }
 
 function getClosestSegment(wx, wy) {
@@ -707,54 +1012,227 @@ function getClosestSegment(wx, wy) {
         if (!layers[pl.layer].visible) continue;
         for (let j = 0; j < pl.points.length - 1; j++) {
             const p1 = pl.points[j]; const p2 = pl.points[j+1];
-            const dist = distToSegment(wx, wy, p1.x, p1.y, p2.x, p2.y);
+            const dist = distToPolylineSegment(wx, wy, p1, p2, p1.bulge);
             if (dist < closestDist) { closestDist = dist; closestInfo = { plIndex: i, segmentIndex: j }; }
         }
         if (pl.closed && pl.points.length > 2) {
             const p1 = pl.points[pl.points.length - 1]; const p2 = pl.points[0];
-            const dist = distToSegment(wx, wy, p1.x, p1.y, p2.x, p2.y);
+            const dist = distToPolylineSegment(wx, wy, p1, p2, p1.bulge);
             if (dist < closestDist) { closestDist = dist; closestInfo = { plIndex: i, segmentIndex: pl.points.length - 1 }; }
         }
     }
     return closestInfo;
 }
 
-function getSnapPoint(wx, wy) {
+function getPerpendicularPoint(px, py, A, B, bulge = 0) {
+    if (!bulge || bulge === 0) {
+        const dx = B.x - A.x;
+        const dy = B.y - A.y;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq === 0) return null;
+        const t = ((px - A.x) * dx + (py - A.y) * dy) / lenSq;
+        if (t >= 0 && t <= 1) {
+            return { x: A.x + t * dx, y: A.y + t * dy };
+        }
+    }
+    return null;
+}
+
+function getExtensionPoint(wx, wy, A, B, bulge = 0) {
+    if (!bulge || bulge === 0) {
+        const dx = B.x - A.x;
+        const dy = B.y - A.y;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq === 0) return null;
+        const t = ((wx - A.x) * dx + (wy - A.y) * dy) / lenSq;
+        if (t < -0.01 || t > 1.01) {
+            const extX = A.x + t * dx;
+            const extY = A.y + t * dy;
+            if (Math.hypot(extX - wx, extY - wy) < 15 / scale) {
+                return { x: extX, y: extY };
+            }
+        }
+    }
+    return null;
+}
+
+function getLineIntersection(A, B, C, D) {
+    const denom = (A.x - B.x)*(C.y - D.y) - (A.y - B.y)*(C.x - D.x);
+    if (Math.abs(denom) < 1e-6) return null; // Parallel
+    const t = ((A.x - C.x)*(C.y - D.y) - (A.y - C.y)*(C.x - D.x)) / denom;
+    const u = ((A.x - C.x)*(A.y - B.y) - (A.y - C.y)*(A.x - B.x)) / denom;
+    if (t >= -0.01 && t <= 1.01 && u >= -0.01 && u <= 1.01) {
+        return { x: A.x + t*(B.x - A.x), y: A.y + t*(B.y - A.y) };
+    }
+    return null;
+}
+
+function getLineArcIntersection(p1, p2, arc) {
+    const dx = p2.x - p1.x; const dy = p2.y - p1.y;
+    const fx = p1.x - arc.cx; const fy = p1.y - arc.cy;
+    const a = dx*dx + dy*dy;
+    const b = 2 * (fx*dx + fy*dy);
+    const c = fx*fx + fy*fy - arc.R*arc.R;
+    
+    let discriminant = b*b - 4*a*c;
+    if (discriminant < 0) return [];
+    
+    let intersections = [];
+    discriminant = Math.sqrt(discriminant);
+    let t1 = (-b - discriminant) / (2*a);
+    let t2 = (-b + discriminant) / (2*a);
+    
+    if (t1 >= -0.01 && t1 <= 1.01) {
+        let pt = {x: p1.x + t1*dx, y: p1.y + t1*dy};
+        if (isPointInArcSpan(pt.x, pt.y, arc)) intersections.push(pt);
+    }
+    if (t2 >= -0.01 && t2 <= 1.01) {
+        let pt = {x: p1.x + t2*dx, y: p1.y + t2*dy};
+        if (isPointInArcSpan(pt.x, pt.y, arc)) intersections.push(pt);
+    }
+    return intersections;
+}
+
+function getArcArcIntersection(arc1, arc2) {
+    const dx = arc2.cx - arc1.cx; const dy = arc2.cy - arc1.cy;
+    const d = Math.hypot(dx, dy);
+    
+    if (d > arc1.R + arc2.R) return [];
+    if (d < Math.abs(arc1.R - arc2.R)) return [];
+    if (d === 0 && arc1.R === arc2.R) return [];
+    
+    const a = (arc1.R*arc1.R - arc2.R*arc2.R + d*d) / (2*d);
+    let hSq = arc1.R*arc1.R - a*a;
+    if (hSq < 0) hSq = 0; // Floating point error
+    const h = Math.sqrt(hSq);
+    
+    const cx2 = arc1.cx + a * (dx / d);
+    const cy2 = arc1.cy + a * (dy / d);
+    
+    const intersections = [];
+    const pt1 = { x: cx2 + h * (dy / d), y: cy2 - h * (dx / d) };
+    const pt2 = { x: cx2 - h * (dy / d), y: cy2 + h * (dx / d) };
+    
+    if (isPointInArcSpan(pt1.x, pt1.y, arc1) && isPointInArcSpan(pt1.x, pt1.y, arc2)) {
+        intersections.push(pt1);
+    }
+    if (d > 0 && h > 0) {
+        if (isPointInArcSpan(pt2.x, pt2.y, arc1) && isPointInArcSpan(pt2.x, pt2.y, arc2)) {
+            intersections.push(pt2);
+        }
+    }
+    return intersections;
+}
+
+function getSnapPoint(wx, wy, refPoint = null) {
     if (!snapToggle.checked) return null;
     const SNAP_DIST_WORLD = 15 / scale;
-    let closestDist = SNAP_DIST_WORLD; let closestPoint = null;
+    let minDists = { endpoint: SNAP_DIST_WORLD, midpoint: SNAP_DIST_WORLD, center: SNAP_DIST_WORLD, intersection: SNAP_DIST_WORLD, perpendicular: SNAP_DIST_WORLD, extension: SNAP_DIST_WORLD, grid: SNAP_DIST_WORLD };
+    let bestSnaps = { endpoint: null, midpoint: null, center: null, intersection: null, perpendicular: null, extension: null, grid: null };
+    let closeSegments = [];
 
-    for (const pl of polylines) {
-        if (!layers[pl.layer].visible) continue;
-        for (const p of pl.points) {
-            const dist = Math.hypot(p.x - wx, p.y - wy);
-            if (dist < closestDist) { closestDist = dist; closestPoint = { x: p.x, y: p.y }; }
+    const checkPoint = (p, type, data = null) => {
+        if (!p) return;
+        const dist = Math.hypot(p.x - wx, p.y - wy);
+        if (dist < minDists[type]) {
+            minDists[type] = dist;
+            bestSnaps[type] = { x: p.x, y: p.y, type: type, data: data };
+        }
+    };
+
+    const processPolyline = (pl) => {
+        if (pl.layer && layers[pl.layer] && !layers[pl.layer].visible) return;
+        for (let i = 0; i < pl.points.length; i++) {
+            const p1 = pl.points[i];
+            checkPoint(p1, 'endpoint');
+            
+            let p2 = null;
+            if (i < pl.points.length - 1) p2 = pl.points[i + 1];
+            else if (pl.closed && pl.points.length > 2) p2 = pl.points[0];
+            
+            if (p2) {
+                if (p1.bulge && p1.bulge !== 0) {
+                    const arc = getArcParams(p1, p2, p1.bulge);
+                    if (arc) {
+                        checkPoint(getArcMidpoint(arc), 'midpoint');
+                        checkPoint({x: arc.cx, y: arc.cy}, 'center');
+                        if (refPoint) {
+                            const angle = Math.atan2(refPoint.y - arc.cy, refPoint.x - arc.cx);
+                            const perp1 = { x: arc.cx + arc.R * Math.cos(angle), y: arc.cy + arc.R * Math.sin(angle) };
+                            const perp2 = { x: arc.cx - arc.R * Math.cos(angle), y: arc.cy - arc.R * Math.sin(angle) };
+                            checkPoint(perp1, 'perpendicular');
+                            checkPoint(perp2, 'perpendicular');
+                        }
+                        const distToArcCenter = Math.hypot(wx - arc.cx, wy - arc.cy);
+                        if (Math.abs(distToArcCenter - arc.R) < SNAP_DIST_WORLD * 4) {
+                            closeSegments.push({p1, p2, isArc: true, arcParams: arc});
+                        }
+                    }
+                } else {
+                    checkPoint({ x: (p1.x + p2.x)/2, y: (p1.y + p2.y)/2 }, 'midpoint');
+                    if (refPoint) {
+                        const perp = getPerpendicularPoint(refPoint.x, refPoint.y, p1, p2, 0);
+                        if (perp) checkPoint(perp, 'perpendicular');
+                    }
+                    const ext = getExtensionPoint(wx, wy, p1, p2, 0);
+                    if (ext) checkPoint(ext, 'extension', {p1, p2});
+                    
+                    const distToSeg = distToSegment(wx, wy, p1.x, p1.y, p2.x, p2.y);
+                    if (distToSeg < SNAP_DIST_WORLD * 4) {
+                        closeSegments.push({p1, p2, isArc: false});
+                    }
+                }
+            }
+        }
+    };
+
+    for (const pl of polylines) processPolyline(pl);
+    if (currentPolyline) processPolyline(currentPolyline);
+    
+    // Check intersections among close segments
+    for (let i = 0; i < closeSegments.length; i++) {
+        for (let j = i + 1; j < closeSegments.length; j++) {
+            const seg1 = closeSegments[i];
+            const seg2 = closeSegments[j];
+            let inters = [];
+            
+            if (!seg1.isArc && !seg2.isArc) {
+                const pt = getLineIntersection(seg1.p1, seg1.p2, seg2.p1, seg2.p2);
+                if (pt) inters.push(pt);
+            } else if (seg1.isArc && !seg2.isArc) {
+                inters = getLineArcIntersection(seg2.p1, seg2.p2, seg1.arcParams);
+            } else if (!seg1.isArc && seg2.isArc) {
+                inters = getLineArcIntersection(seg1.p1, seg1.p2, seg2.arcParams);
+            } else {
+                inters = getArcArcIntersection(seg1.arcParams, seg2.arcParams);
+            }
+            
+            inters.forEach(pt => checkPoint(pt, 'intersection'));
         }
     }
     
-    if (currentPolyline) {
-        for (const p of currentPolyline.points) {
-            const dist = Math.hypot(p.x - wx, p.y - wy);
-            if (dist < closestDist) { closestDist = dist; closestPoint = { x: p.x, y: p.y }; }
-        }
-    }
-    
-    if (!closestPoint && workspaceSettings.grid.enabled && workspaceSettings.grid.type === 'absolute') {
+    if (workspaceSettings.grid.enabled && workspaceSettings.grid.type === 'absolute') {
         const rad = workspaceSettings.grid.angle * Math.PI / 180;
         const unrot = rotatePoint(wx, wy, -rad);
         const gx = workspaceSettings.grid.sizeX; const gy = workspaceSettings.grid.sizeY;
         const nearestX = Math.round(unrot.x / gx) * gx; const nearestY = Math.round(unrot.y / gy) * gy;
         const trueWorld = rotatePoint(nearestX, nearestY, rad);
-        const dist = Math.hypot(trueWorld.x - wx, trueWorld.y - wy);
-        if (dist < closestDist) { closestDist = dist; closestPoint = { x: trueWorld.x, y: trueWorld.y }; }
+        checkPoint(trueWorld, 'grid');
     }
-    return closestPoint;
+
+    if (bestSnaps.intersection) return bestSnaps.intersection;
+    if (bestSnaps.endpoint) return bestSnaps.endpoint;
+    if (bestSnaps.midpoint) return bestSnaps.midpoint;
+    if (bestSnaps.center) return bestSnaps.center;
+    if (bestSnaps.perpendicular) return bestSnaps.perpendicular;
+    if (bestSnaps.extension) return bestSnaps.extension;
+    if (bestSnaps.grid) return bestSnaps.grid;
+    
+    return null;
 }
 
 function updateWorldCoordinates(rawWx, rawWy) {
     rawWorldX = rawWx; rawWorldY = rawWy;
-    snapPoint = getSnapPoint(rawWx, rawWy);
-    worldX = rawWx; worldY = rawWy;
     
     let isOrthoApplicable = false;
     let refPoint = null;
@@ -765,7 +1243,13 @@ function updateWorldCoordinates(rawWx, rawWy) {
     } else if (currentTool === 'move' && moveState === 'DESTINATION' && moveOrigin) {
         refPoint = moveOrigin;
         isOrthoApplicable = true;
+    } else if (currentTool === 'rotate' && rotateState === 'ANGLE' && rotateOrigin) {
+        refPoint = rotateOrigin;
+        isOrthoApplicable = true;
     }
+
+    snapPoint = getSnapPoint(rawWx, rawWy, refPoint);
+    worldX = rawWx; worldY = rawWy;
     
     if (isOrthoApplicable) {
         let dx = rawWx - refPoint.x; let dy = rawWy - refPoint.y;
@@ -801,83 +1285,209 @@ function updateWorldCoordinates(rawWx, rawWy) {
 
 // Properties & Deletion
 function updatePropertiesPanel() {
-    if (!selectedObject) {
+    if (!selectedObjects || selectedObjects.length === 0) {
         propertiesPanel.style.display = 'none';
         return;
     }
     propertiesPanel.style.display = 'block';
     
-    if (selectedObject.type === 'page') {
-        const p = pages[selectedObject.index];
-        if (!p) return;
-        propType.textContent = 'Página (Layout)';
+    const types = new Set(selectedObjects.map(o => o.type));
+    
+    if (types.size > 1) {
+        propType.textContent = 'Selección Mixta (' + selectedObjects.length + ')';
+        propLayerContainer.style.display = 'none';
+        propLengthContainer.style.display = 'none';
+        propLblSizeContainer.style.display = 'none';
+        propLblPrecContainer.style.display = 'none';
+        propPageContainer.style.display = 'none';
+        
+        if (!types.has('page')) {
+            propLayerContainer.style.display = 'block';
+            let firstLayer = null;
+            let mixedLayer = false;
+            selectedObjects.forEach(o => {
+                const layer = o.type === 'polyline' ? polylines[o.plIndex].layer : (labels[o.index].layer || '0');
+                if (firstLayer === null) firstLayer = layer;
+                else if (firstLayer !== layer) mixedLayer = true;
+            });
+            propLayer.value = mixedLayer ? '' : firstLayer;
+        }
+        return;
+    }
+    
+    const type = Array.from(types)[0];
+    
+    if (type === 'page') {
+        propType.textContent = selectedObjects.length > 1 ? 'Páginas (' + selectedObjects.length + ')' : 'Página (Layout)';
         propLayerContainer.style.display = 'none';
         propLengthContainer.style.display = 'none';
         propLblSizeContainer.style.display = 'none';
         propLblPrecContainer.style.display = 'none';
         propPageContainer.style.display = 'flex';
-    } else if (selectedObject.type === 'polyline') {
-        const pl = polylines[selectedObject.plIndex];
-        if (!pl) return;
-        propType.textContent = 'Polilínea'; 
-        propLayer.value = pl.layer;
+        btnEditPage.style.display = selectedObjects.length === 1 ? 'block' : 'none';
+    } else if (type === 'polyline') {
+        propType.textContent = selectedObjects.length > 1 ? 'Polilíneas (' + selectedObjects.length + ')' : 'Polilínea'; 
         propLayerContainer.style.display = 'block';
-        propLengthContainer.style.display = 'block';
+        propLengthContainer.style.display = selectedObjects.length === 1 ? 'block' : 'none';
         propLblSizeContainer.style.display = 'none';
         propLblPrecContainer.style.display = 'none';
         propPageContainer.style.display = 'none';
-        let len = 0;
-        for(let i=1; i<pl.points.length; i++) len += Math.hypot(pl.points[i].x - pl.points[i-1].x, pl.points[i].y - pl.points[i-1].y);
-        if (pl.closed && pl.points.length > 2) len += Math.hypot(pl.points[0].x - pl.points[pl.points.length-1].x, pl.points[0].y - pl.points[pl.points.length-1].y);
-        propLength.textContent = len.toFixed(2);
-    } else if (selectedObject.type === 'label') {
-        const lbl = labels[selectedObject.index];
-        if (!lbl) return;
-        propType.textContent = 'Etiqueta'; 
-        propLayer.value = lbl.layer || '0'; 
-        propLength.textContent = '-';
-        propLblSize.value = lbl.printSize || 5;
-        propLblPrec.value = lbl.precision !== undefined ? lbl.precision : '';
+        
+        let firstLayer = null;
+        let mixedLayer = false;
+        selectedObjects.forEach(o => {
+            const layer = polylines[o.plIndex].layer;
+            if (firstLayer === null) firstLayer = layer;
+            else if (firstLayer !== layer) mixedLayer = true;
+        });
+        propLayer.value = mixedLayer ? '' : firstLayer;
+        
+        if (selectedObjects.length === 1) {
+            const pl = polylines[(selectedObjects.find(o => o.type === 'polyline') || {}).plIndex];
+            let l = 0;
+            for (let i = 0; i < pl.points.length - 1; i++) {
+                l += Math.hypot(pl.points[i+1].x - pl.points[i].x, pl.points[i+1].y - pl.points[i].y);
+            }
+            propLength.textContent = (l * documentSettings.scale).toFixed(2);
+        }
+    } else if (type === 'label') {
+        propType.textContent = selectedObjects.length > 1 ? 'Etiquetas (' + selectedObjects.length + ')' : 'Etiqueta';
         propLayerContainer.style.display = 'block';
-        propLengthContainer.style.display = 'block';
+        propLengthContainer.style.display = 'none';
         propLblSizeContainer.style.display = 'block';
         propLblPrecContainer.style.display = 'block';
         propPageContainer.style.display = 'none';
+        
+        let firstLayer = null, mixedLayer = false;
+        let firstSize = null, mixedSize = false;
+        let firstPrec = null, mixedPrec = false;
+        
+        selectedObjects.forEach(o => {
+            const lbl = labels[o.index];
+            if (!lbl) return;
+            const layer = lbl.layer || '0';
+            const size = lbl.printSize || 5;
+            const prec = lbl.precision !== undefined ? lbl.precision : '';
+            
+            if (firstLayer === null) firstLayer = layer; else if (firstLayer !== layer) mixedLayer = true;
+            if (firstSize === null) firstSize = size; else if (firstSize !== size) mixedSize = true;
+            if (firstPrec === null) firstPrec = prec; else if (firstPrec !== prec) mixedPrec = true;
+        });
+        
+        propLayer.value = mixedLayer ? '' : firstLayer;
+        propLblSize.value = mixedSize ? '' : firstSize;
+        propLblPrec.value = mixedPrec ? '' : firstPrec;
     }
 }
+
 propLayer.addEventListener('change', (e) => {
-    if (selectedObject && selectedObject.type === 'polyline') { polylines[selectedObject.plIndex].layer = e.target.value; draw(); }
-    else if (selectedObject && selectedObject.type === 'label') { labels[selectedObject.index].layer = e.target.value; draw(); }
+    if (!selectedObjects.length) return;
+    const val = e.target.value;
+    if (!val) return;
+    selectedObjects.forEach(o => {
+        if (o.type === 'polyline') polylines[o.plIndex].layer = val;
+        else if (o.type === 'label') labels[o.index].layer = val;
+    });
+    draw();
 });
 propLblSize.addEventListener('change', (e) => {
-    if (selectedObject && selectedObject.type === 'label') { 
-        labels[selectedObject.index].printSize = parseFloat(e.target.value) || 5; 
-        draw();
-    }
+    if (!selectedObjects.length) return;
+    const val = parseFloat(e.target.value);
+    if (isNaN(val)) return;
+    selectedObjects.forEach(o => {
+        if (o.type === 'label') labels[o.index].printSize = val;
+    });
+    draw();
 });
 propLblPrec.addEventListener('change', (e) => {
-    if (selectedObject && selectedObject.type === 'label') { 
-        const val = e.target.value;
-        if (val === '') delete labels[selectedObject.index].precision;
-        else labels[selectedObject.index].precision = parseInt(val) || 0;
-        draw();
-    }
+    if (!selectedObjects.length) return;
+    const valStr = e.target.value;
+    selectedObjects.forEach(o => {
+        if (o.type === 'label') {
+            if (valStr === '') delete labels[o.index].precision;
+            else labels[o.index].precision = parseInt(valStr) || 0;
+        }
+    });
+    draw();
 });
 btnEditPage.addEventListener('click', () => {
-    if (selectedObject && selectedObject.type === 'page') {
-        openPageModal(selectedObject.index);
+    if (selectedObjects.length === 1 && selectedObjects[0].type === 'page') {
+        openPageModal(selectedObjects[0].index);
     }
 });
-btnDelete.addEventListener('click', deleteSelected);
-function deleteSelected() {
-    if (selectedObject && selectedObject.type === 'polyline') {
-        polylines[selectedObject.plIndex].layer = 'basura'; selectedObject = null; updatePropertiesPanel(); draw();
-    } else if (selectedObject && selectedObject.type === 'label') {
-        labels.splice(selectedObject.index, 1); selectedObject = null; updatePropertiesPanel(); draw();
-    } else if (selectedObject && selectedObject.type === 'page') {
-        pages.splice(selectedObject.index, 1); selectedObject = null; selectedPageIdx = -1; draw();
+if (btnDelete) btnDelete.addEventListener('click', deleteSelected);
+const btnCopy = document.getElementById('btn-copy');
+if (btnCopy) btnCopy.addEventListener('click', copySelected);
+const btnPaste = document.getElementById('btn-paste');
+if (btnPaste) btnPaste.addEventListener('click', pasteClipboard);
+
+function copySelected() {
+    if (selectedObjects.length > 0) {
+        clipboard = selectedObjects.map(o => {
+            if (o.type === 'polyline') {
+                const pl = polylines[o.plIndex];
+                return { type: 'polyline', data: JSON.parse(JSON.stringify(pl)), layerInfo: layers[pl.layer] };
+            }
+            if (o.type === 'label') {
+                const lbl = labels[o.index];
+                return { type: 'label', data: JSON.parse(JSON.stringify(lbl)), layerInfo: layers[lbl.layer || '0'] };
+            }
+            if (o.type === 'page') return { type: 'page', data: JSON.parse(JSON.stringify(pages[o.index])) };
+            return null;
+        }).filter(o => o !== null);
+        console.log('Copiado al portapapeles multiverso', clipboard.length);
     }
 }
+
+function pasteClipboard() {
+    if (clipboard.length > 0) {
+        selectedObjects = [];
+        let layersChanged = false;
+        clipboard.forEach(c => {
+            const clonedData = JSON.parse(JSON.stringify(c.data));
+            
+            if (c.layerInfo) {
+                const layerName = clonedData.layer || '0';
+                if (!layers[layerName]) {
+                    layers[layerName] = JSON.parse(JSON.stringify(c.layerInfo));
+                    layersChanged = true;
+                }
+            }
+
+            if (c.type === 'polyline') {
+                polylines.push(clonedData);
+                selectedObjects.push({ type: 'polyline', plIndex: polylines.length - 1 });
+            } else if (c.type === 'label') {
+                labels.push(clonedData);
+                selectedObjects.push({ type: 'label', index: labels.length - 1 });
+            } else if (c.type === 'page') {
+                pages.push(clonedData);
+                selectedObjects.push({ type: 'page', index: pages.length - 1 });
+            }
+        });
+        if (layersChanged) updateLayersPanel();
+        updatePropertiesPanel();
+        draw();
+        commitTimeMap('Pegado múltiple desde portapapeles');
+    }
+}
+function deleteSelected() {
+    if (!selectedObjects || selectedObjects.length === 0) return;
+    
+    const plsToDelete = selectedObjects.filter(o => o.type === 'polyline').map(o => o.plIndex).sort((a,b)=>b-a);
+    const lblsToDelete = selectedObjects.filter(o => o.type === 'label').map(o => o.index).sort((a,b)=>b-a);
+    const pagesToDelete = selectedObjects.filter(o => o.type === 'page').map(o => o.index).sort((a,b)=>b-a);
+    
+    plsToDelete.forEach(idx => { polylines[idx].layer = 'basura'; });
+    lblsToDelete.forEach(idx => { labels.splice(idx, 1); });
+    pagesToDelete.forEach(idx => { pages.splice(idx, 1); });
+    
+    selectedObjects = [];
+    updatePropertiesPanel();
+    draw();
+    commitTimeMap('Borrado múltiple');
+}
+
 
 // Events
 let draggingPage = null;
@@ -909,7 +1519,6 @@ canvas.addEventListener('mousedown', (e) => {
         const onMouseUp = () => { isDragging = false; document.removeEventListener('mousemove', onMouseMove); document.removeEventListener('mouseup', onMouseUp); };
         document.addEventListener('mousemove', onMouseMove); document.addEventListener('mouseup', onMouseUp);
         
-        if (currentTool === 'select' && e.button === 0) { selectedObject = null; selectedPageIdx = -1; updatePropertiesPanel(); draw(); }
         return;
     }
 
@@ -919,47 +1528,113 @@ canvas.addEventListener('mousedown', (e) => {
             if (currentPolyline.points.length >= 2) {
                 const firstPt = currentPolyline.points[0];
                 if (Math.hypot(worldX - firstPt.x, worldY - firstPt.y) < 1e-4) {
+                    if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
                     currentPolyline.closed = true;
                     polylines.push(currentPolyline);
+                    commitTimeMap('Forma creada');
                     currentPolyline = null;
+                    polylineMode = 'line';
                     typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
                     return;
                 }
             }
+            if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
             currentPolyline.points.push({ x: worldX, y: worldY });
             typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
         } else if (currentTool === 'select') {
+            const gripHit = getClosestGrip(worldX, worldY);
+            if (gripHit) {
+                let draggingGrip = gripHit;
+                const pl = polylines[(selectedObjects.find(o => o.type === 'polyline') || {}).plIndex];
+                
+                const onMouseMoveGrip = (eMove) => {
+                    if (draggingGrip.type === 'vertex') {
+                        pl.points[draggingGrip.index].x = worldX;
+                        pl.points[draggingGrip.index].y = worldY;
+                    } else if (draggingGrip.type === 'midpoint') {
+                        let nextIdx = draggingGrip.index + 1;
+                        if (nextIdx === pl.points.length) nextIdx = 0;
+                        const p1 = pl.points[draggingGrip.index];
+                        const p2 = pl.points[nextIdx];
+                        
+                        const L = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+                        if (L > 1e-5) {
+                            const dx = p2.x - p1.x; const dy = p2.y - p1.y;
+                            const cross = dx * (worldY - p1.y) - dy * (worldX - p1.x);
+                            const h = cross / L;
+                            pl.points[draggingGrip.index].bulge = - (2 * h) / L;
+                        }
+                    }
+                    draw();
+                };
+                const onMouseUpGrip = () => {
+                    document.removeEventListener('mousemove', onMouseMoveGrip);
+                    document.removeEventListener('mouseup', onMouseUpGrip);
+                    updatePropertiesPanel();
+                    commitTimeMap('Geometría modificada (Grips)');
+                };
+                document.addEventListener('mousemove', onMouseMoveGrip);
+                document.addEventListener('mouseup', onMouseUpGrip);
+                return;
+            }
+
             const hit = getClosestSegment(worldX, worldY);
             if (hit) {
-                if (hit.type === 'page') {
-                    selectedObject = { type: 'page', index: hit.index };
-                    selectedPageIdx = hit.index;
+                let hitObj = null;
+                if (hit.type === 'page') hitObj = { type: 'page', index: hit.index };
+                else if (hit.type === 'label') hitObj = { type: 'label', index: hit.index };
+                else hitObj = { type: 'polyline', plIndex: hit.plIndex, segmentIndex: hit.segmentIndex };
+                
+                if (e.shiftKey) {
+                    const existingIdx = selectedObjects.findIndex(o => 
+                        o.type === hitObj.type && 
+                        (o.type === 'polyline' ? o.plIndex === hitObj.plIndex : o.index === hitObj.index)
+                    );
+                    if (existingIdx >= 0) selectedObjects.splice(existingIdx, 1);
+                    else selectedObjects.push(hitObj);
+                } else {
+                    const isAlreadySelected = selectedObjects.some(o => 
+                        o.type === hitObj.type && 
+                        (o.type === 'polyline' ? o.plIndex === hitObj.plIndex : o.index === hitObj.index)
+                    );
+                    if (!isAlreadySelected) {
+                        selectedObjects = [hitObj];
+                    }
+                }
+                
+                if (hit.type === 'page' && selectedObjects.length === 1 && selectedObjects[0].type === 'page') {
                     draggingPage = hit.index;
                     const origX = pages[hit.index].x;
                     const origY = pages[hit.index].y;
-                    
+                    const onMouseMovePage = (moveEvent) => {
+                        pages[draggingPage].x = worldX;
+                        pages[draggingPage].y = worldY;
+                        draw();
+                    };
+                    document.addEventListener('mousemove', onMouseMovePage);
                     const onMouseUpPage = (eUp) => {
                         if (eUp.ctrlKey) {
                             const newPage = JSON.parse(JSON.stringify(pages[draggingPage]));
                             pages[draggingPage].x = origX;
                             pages[draggingPage].y = origY;
                             pages.push(newPage);
-                            selectedObject = { type: 'page', index: pages.length - 1 };
-                            selectedPageIdx = pages.length - 1;
+                            selectedObjects = [{ type: 'page', index: pages.length - 1 }];
+                            commitTimeMap('Página clonada');
+                        } else if (pages[draggingPage].x !== origX || pages[draggingPage].y !== origY) {
+                            commitTimeMap('Página movida');
                         }
                         draggingPage = null; 
-                        document.removeEventListener('mouseup', onMouseUpPage); 
+                        document.removeEventListener('mousemove', onMouseMovePage);
+                        document.removeEventListener('mouseup', onMouseUpPage);
+                        updatePropertiesPanel();
                         draw();
                     };
                     document.addEventListener('mouseup', onMouseUpPage);
-                } else if (hit.type === 'label') {
-                    selectedObject = { type: 'label', index: hit.index };
-                } else {
-                    selectedObject = { type: 'polyline', plIndex: hit.plIndex, segmentIndex: hit.segmentIndex };
                 }
             } else {
-                selectedObject = null;
-                selectedPageIdx = -1;
+                if (!e.shiftKey) {
+                    selectedObjects = [];
+                }
             }
             updatePropertiesPanel();
             draw();
@@ -967,7 +1642,7 @@ canvas.addEventListener('mousedown', (e) => {
             const hit = getClosestSegment(worldX, worldY);
             if (hit && !hit.type) {
                 const text = prompt("Ingrese el texto (use #longitud# o #capa# para variables):", "L = #longitud#");
-                if (text) { labels.push({ text: text, plIndex: hit.plIndex, segmentIndex: hit.segmentIndex, layer: currentLayer }); draw(); }
+                if (text) { labels.push({ text: text, plIndex: hit.plIndex, segmentIndex: hit.segmentIndex, layer: currentLayer }); commitTimeMap('Etiqueta creada'); draw(); }
             }
         } else if (currentTool === 'move') {
             if (moveState === 'SELECTING') {
@@ -993,6 +1668,36 @@ canvas.addEventListener('mousedown', (e) => {
                 typedLength = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = '';
                 draw();
             }
+        } else if (currentTool === 'rotate') {
+            if (rotateState === 'SELECTING') {
+                const hit = getClosestSegment(worldX, worldY);
+                if (hit && !hit.type) {
+                    const idx = rotateSelection.findIndex(s => s.type === 'polyline' && s.index === hit.plIndex);
+                    if (idx === -1) rotateSelection.push({ type: 'polyline', index: hit.plIndex });
+                    else rotateSelection.splice(idx, 1);
+                } else if (hit && hit.type === 'label') {
+                    const idx = rotateSelection.findIndex(s => s.type === 'label' && s.index === hit.index);
+                    if (idx === -1) rotateSelection.push({ type: 'label', index: hit.index });
+                    else rotateSelection.splice(idx, 1);
+                }
+                draw();
+            } else if (rotateState === 'ORIGIN') {
+                rotateOrigin = { x: worldX, y: worldY };
+                rotateState = 'REFERENCE';
+                draw();
+            } else if (rotateState === 'REFERENCE') {
+                rotateReference = { x: worldX, y: worldY };
+                rotateState = 'ANGLE';
+                rotateModifier = ''; rotateCommandInput = '';
+                typedLength = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = '';
+                draw();
+            } else if (rotateState === 'ANGLE') {
+                rotateTargetPoint = { x: worldX, y: worldY };
+                rotateState = 'ADJUSTING';
+                draw();
+            } else if (rotateState === 'ADJUSTING') {
+                commitRotate(rotateTargetPoint.x, rotateTargetPoint.y);
+            }
         }
     }
 });
@@ -1000,7 +1705,10 @@ canvas.addEventListener('mousedown', (e) => {
 canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     if (currentTool === 'polyline' && currentPolyline) {
-        if (currentPolyline.points.length > 1) polylines.push(currentPolyline);
+        if (currentPolyline.points.length > 1) {
+            polylines.push(currentPolyline);
+            commitTimeMap('Polilínea terminada (Click derecho)');
+        }
         currentPolyline = null; typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
     }
 });
@@ -1014,6 +1722,17 @@ canvas.addEventListener('wheel', (e) => {
 
 document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+
+    if (e.ctrlKey && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (timeMap.activeNodeId && timeMap.nodes[timeMap.activeNodeId]) {
+            const current = timeMap.nodes[timeMap.activeNodeId];
+            if (current.parentId) {
+                checkoutNode(current.parentId);
+            }
+        }
+        return;
+    }
 
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
@@ -1056,7 +1775,6 @@ document.addEventListener('keydown', (e) => {
                             if (currentLen > 0) {
                                 moveDest = { x: moveOrigin.x + (V.x/currentLen)*d, y: moveOrigin.y + (V.y/currentLen)*d };
                             }
-                            moveModifier = '';
                         }
                     }
                     moveCommandInput = '';
@@ -1064,6 +1782,36 @@ document.addEventListener('keydown', (e) => {
                     draw();
                 } else {
                     commitMoveCopy();
+                }
+            }
+            return;
+        } else if (currentTool === 'rotate') {
+            if (rotateState === 'SELECTING') { rotateState = 'ORIGIN'; draw(); }
+            else if (rotateState === 'ORIGIN') { rotateOrigin = { x: worldX, y: worldY }; rotateState = 'REFERENCE'; draw(); }
+            else if (rotateState === 'REFERENCE') { rotateReference = { x: worldX, y: worldY }; rotateState = 'ANGLE'; rotateModifier = ''; rotateCommandInput = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = ''; draw(); }
+            else if (rotateState === 'ANGLE') { rotateTargetPoint = { x: worldX, y: worldY }; rotateState = 'ADJUSTING'; rotateModifier = ''; rotateCommandInput = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = ''; draw(); }
+            else if (rotateState === 'ADJUSTING') {
+                if (rotateCommandInput !== '') {
+                    if (rotateCommandInput.startsWith('/') || rotateCommandInput.startsWith('*')) {
+                        rotateModifier = rotateCommandInput;
+                        isCopyMode = true;
+                    } else {
+                        const ang = parseFloat(rotateCommandInput);
+                        if (!isNaN(ang)) {
+                            let refAngle = 0;
+                            if (rotateReference) refAngle = Math.atan2(rotateReference.y - rotateOrigin.y, rotateReference.x - rotateOrigin.x);
+                            const finalAngle = refAngle + (ang * Math.PI / 180);
+                            rotateTargetPoint = {
+                                x: rotateOrigin.x + Math.cos(finalAngle) * 10,
+                                y: rotateOrigin.y + Math.sin(finalAngle) * 10
+                            };
+                        }
+                    }
+                    rotateCommandInput = '';
+                    lengthInput.value = '';
+                    draw();
+                } else {
+                    commitRotate(rotateTargetPoint.x, rotateTargetPoint.y);
                 }
             }
             return;
@@ -1075,7 +1823,7 @@ document.addEventListener('keydown', (e) => {
             if (btnPolyline) btnPolyline.classList.add('active');
             currentTool = 'polyline';
             currentPolyline = null;
-            selectedObject = null;
+            selectedObjects = [];
             updatePropertiesPanel();
             
             if (lastUsedPoint) {
@@ -1090,13 +1838,17 @@ document.addEventListener('keydown', (e) => {
             if (currentPolyline.points.length >= 2) {
                 const firstPt = currentPolyline.points[0];
                 if (Math.hypot(worldX - firstPt.x, worldY - firstPt.y) < 1e-4) {
+                    if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
                     currentPolyline.closed = true;
                     polylines.push(currentPolyline);
+                    commitTimeMap('Forma creada');
                     currentPolyline = null;
+                    polylineMode = 'line';
                     typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
                     return;
                 }
             }
+            if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
             currentPolyline.points.push({ x: worldX, y: worldY });
             lastUsedPoint = { x: worldX, y: worldY };
             typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
@@ -1109,12 +1861,13 @@ document.addEventListener('keydown', (e) => {
             if (moveState === 'DESTINATION' || moveState === 'ADJUSTING') {
                 isCopyMode = !isCopyMode;
                 if (!isCopyMode && (moveModifier.startsWith('/') || moveModifier.startsWith('*'))) {
-                    moveModifier = ''; // remove array modifier when back to normal move
+                    moveModifier = '';
                 }
                 draw();
             }
         } else if (e.key === 'Escape') {
             moveState = 'SELECTING'; moveSelection = []; moveOrigin = null; moveDest = null; moveModifier = ''; moveCommandInput = ''; isCopyMode = false;
+            rotateState = 'SELECTING'; rotateSelection = []; rotateOrigin = null; rotateReference = null; rotateModifier = ''; rotateCommandInput = '';
             lengthInputOverlay.style.display = 'none'; draw();
         } else if (e.key === 'Enter') {
             if (moveState === 'SELECTING') { moveState = 'ORIGIN'; draw(); }
@@ -1133,7 +1886,6 @@ document.addEventListener('keydown', (e) => {
                             if (currentLen > 0) {
                                 moveDest = { x: moveOrigin.x + (V.x/currentLen)*d, y: moveOrigin.y + (V.y/currentLen)*d };
                             }
-                            moveModifier = '';
                         }
                     }
                     moveCommandInput = '';
@@ -1144,13 +1896,67 @@ document.addEventListener('keydown', (e) => {
                 }
             }
         } else if (moveState === 'ADJUSTING') {
-            if ((e.key >= '0' && e.key <= '9') || e.key === '.' || e.key === '/' || e.key === '*') {
+            if ((e.key >= '0' && e.key <= '9') || e.key === '.' || e.key === '-' || e.key === '/' || e.key === '*') {
                 moveCommandInput += e.key; lengthInput.value = moveCommandInput; draw();
             } else if (e.key === 'Backspace') {
                 moveCommandInput = moveCommandInput.slice(0, -1); lengthInput.value = moveCommandInput; draw();
             }
         }
-    } else if (currentTool === 'polyline') {
+        return;
+    }
+
+    if (currentTool === 'rotate') {
+        if (e.key === 'Control') {
+            if (rotateState === 'ANGLE' || rotateState === 'ADJUSTING') {
+                isCopyMode = !isCopyMode;
+                if (!isCopyMode && (rotateModifier.startsWith('/') || rotateModifier.startsWith('*'))) {
+                    rotateModifier = '';
+                }
+                draw();
+            }
+        } else if (e.key === 'Escape') {
+            moveState = 'SELECTING'; moveSelection = []; moveOrigin = null; moveDest = null; moveModifier = ''; moveCommandInput = ''; isCopyMode = false;
+            rotateState = 'SELECTING'; rotateSelection = []; rotateOrigin = null; rotateReference = null; rotateTargetPoint = null; rotateModifier = ''; rotateCommandInput = '';
+            lengthInputOverlay.style.display = 'none'; draw();
+        } else if (e.key === 'Enter') {
+            if (rotateState === 'SELECTING') { rotateState = 'ORIGIN'; draw(); }
+            else if (rotateState === 'ORIGIN') { rotateOrigin = { x: worldX, y: worldY }; rotateState = 'REFERENCE'; draw(); }
+            else if (rotateState === 'REFERENCE') { rotateReference = { x: worldX, y: worldY }; rotateState = 'ANGLE'; rotateModifier = ''; rotateCommandInput = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = ''; draw(); }
+            else if (rotateState === 'ANGLE') { rotateTargetPoint = { x: worldX, y: worldY }; rotateState = 'ADJUSTING'; rotateModifier = ''; rotateCommandInput = ''; lengthInputOverlay.style.display = 'flex'; lengthInput.value = ''; draw(); }
+            else if (rotateState === 'ADJUSTING') {
+                if (rotateCommandInput !== '') {
+                    if (rotateCommandInput.startsWith('/') || rotateCommandInput.startsWith('*')) {
+                        rotateModifier = rotateCommandInput;
+                        isCopyMode = true;
+                    } else {
+                        const ang = parseFloat(rotateCommandInput);
+                        if (!isNaN(ang)) {
+                            let refAngle = 0;
+                            if (rotateReference) refAngle = Math.atan2(rotateReference.y - rotateOrigin.y, rotateReference.x - rotateOrigin.x);
+                            const finalAngle = refAngle + (ang * Math.PI / 180);
+                            rotateTargetPoint = {
+                                x: rotateOrigin.x + Math.cos(finalAngle) * 10,
+                                y: rotateOrigin.y + Math.sin(finalAngle) * 10
+                            };
+                        }
+                    }
+                    rotateCommandInput = '';
+                    lengthInput.value = '';
+                    draw();
+                } else {
+                    commitRotate(rotateTargetPoint.x, rotateTargetPoint.y);
+                }
+            }
+        } else if (rotateState === 'ANGLE' || rotateState === 'ADJUSTING') {
+            if ((e.key >= '0' && e.key <= '9') || e.key === '.' || e.key === '-' || e.key === '/' || e.key === '*') {
+                rotateCommandInput += e.key; lengthInput.value = rotateCommandInput; draw();
+            } else if (e.key === 'Backspace') {
+                rotateCommandInput = rotateCommandInput.slice(0, -1); lengthInput.value = rotateCommandInput; draw();
+            }
+        }
+        return;
+    }
+    if (currentTool === 'polyline') {
         if ((e.key >= '0' && e.key <= '9') || e.key === '.') {
             typedLength += e.key; lengthInput.value = typedLength; lengthInputOverlay.style.display = 'flex'; updateWorldCoordinates(rawWorldX, rawWorldY); draw();
         } else if (e.key === 'Backspace') {
@@ -1159,28 +1965,42 @@ document.addEventListener('keydown', (e) => {
             updateWorldCoordinates(rawWorldX, rawWorldY); draw();
         } else if (e.key === 'Enter') {
             if (typedLength !== '' && currentPolyline) {
+                if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
                 currentPolyline.points.push({ x: worldX, y: worldY }); typedLength = ''; lengthInputOverlay.style.display = 'none'; updateWorldCoordinates(rawWorldX, rawWorldY); draw();
             } else if (currentPolyline) {
-                if (currentPolyline.points.length > 1) polylines.push(currentPolyline);
-                currentPolyline = null; draw();
+                if (currentPolyline.points.length > 1) { polylines.push(currentPolyline); commitTimeMap('Polilínea terminada (Enter)'); }
+                currentPolyline = null; polylineMode = 'line'; draw();
             }
         } else if (e.key === 'Escape') {
             typedLength = ''; lengthInputOverlay.style.display = 'none';
-            if (currentPolyline) { if (currentPolyline.points.length > 1) polylines.push(currentPolyline); currentPolyline = null; }
+            if (currentPolyline) { if (currentPolyline.points.length > 1) { polylines.push(currentPolyline); commitTimeMap('Polilínea interrumpida (Escape)'); } currentPolyline = null; polylineMode = 'line'; }
             draw();
         } else if (e.key.toLowerCase() === 'c') {
             if (currentPolyline && currentPolyline.points.length >= 2) {
+                if (currentPolyline.points.length > 0) currentPolyline.points[currentPolyline.points.length - 1].bulge = currentPreviewBulge;
                 currentPolyline.closed = true;
                 polylines.push(currentPolyline);
+                commitTimeMap('Polilínea cerrada (C)');
                 currentPolyline = null;
+                polylineMode = 'line';
                 typedLength = ''; lengthInputOverlay.style.display = 'none'; draw();
             }
+        } else if (e.key.toLowerCase() === 'a') {
+            polylineMode = 'arc'; draw();
+        } else if (e.key.toLowerCase() === 'l') {
+            polylineMode = 'line'; draw();
         }
     } else if (currentTool === 'select' || currentTool === 'label') {
         if (e.key === 'Delete' || e.key === 'Backspace') {
             deleteSelected();
+        } else if (e.key.toLowerCase() === 'c' && e.ctrlKey) {
+            copySelected();
+        } else if (e.key.toLowerCase() === 'v' && e.ctrlKey) {
+            pasteClipboard();
         } else if (e.key === 'Escape') {
-            selectedObject = null; selectedPageIdx = -1; updatePropertiesPanel(); draw();
+            selectedObjects = [];
+            updatePropertiesPanel();
+            draw();
         }
     }
 });
@@ -1191,8 +2011,30 @@ function getSegmentData(plIndex, segIndex) {
     const p1 = pl.points[segIndex]; let p2;
     if (segIndex === pl.points.length - 1 && pl.closed) p2 = pl.points[0]; else p2 = pl.points[segIndex + 1];
     if (!p1 || !p2) return null;
-    const len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    return { p1, p2, len, layer: pl.layer };
+    
+    let len = 0;
+    let midX = 0, midY = 0;
+    if (p1.bulge && p1.bulge !== 0) {
+        const arc = getArcParams(p1, p2, p1.bulge);
+        if (arc) {
+            let span = arc.endAngle - arc.startAngle;
+            while(span <= -Math.PI) span += 2*Math.PI;
+            while(span > Math.PI) span -= 2*Math.PI;
+            if (arc.ccw && span < 0) span += 2*Math.PI;
+            if (!arc.ccw && span > 0) span -= 2*Math.PI;
+            len = Math.abs(span) * arc.R;
+            const mid = getArcMidpoint(arc);
+            midX = mid.x; midY = mid.y;
+        } else {
+            len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+            midX = (p1.x + p2.x)/2; midY = (p1.y + p2.y)/2;
+        }
+    } else {
+        len = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        midX = (p1.x + p2.x)/2; midY = (p1.y + p2.y)/2;
+    }
+    
+    return { p1, p2, len, layer: pl.layer, midX, midY };
 }
 
 function parseVars(str, page) {
@@ -1327,22 +2169,61 @@ function draw() {
 
     // 3. Draw Grid
     drawGrid();
+
+    // ORACLE GHOSTS
+    if (isOracleActive && timeMap.activeNodeId) {
+        const futures = getFuturePaths(timeMap.activeNodeId);
+        futures.secondaryLeafIds.forEach(id => {
+            const hue = timeMap.nodes[id].hue || 200;
+            renderStateElements(timeMap.nodes[id].state, `hsla(${hue}, 70%, 50%, 0.15)`);
+        });
+        if (futures.primaryLeafId) {
+            const hue = timeMap.nodes[futures.primaryLeafId].hue || 200;
+            renderStateElements(timeMap.nodes[futures.primaryLeafId].state, `hsla(${hue}, 90%, 60%, 0.3)`);
+        }
+    }
+
     
     // 4. Draw Polylines
     for (let i = 0; i < polylines.length; i++) {
         const pl = polylines[i];
         const layerData = layers[pl.layer];
         if (!layerData || !layerData.visible) continue;
-        const isSelected = (selectedObject && selectedObject.type === 'polyline' && selectedObject.plIndex === i) || 
-                           (currentTool === 'move' && moveSelection.some(s => s.type === 'polyline' && s.index === i));
-        ctx.strokeStyle = isSelected ? (currentTool === 'move' ? '#ffa500' : '#4a90e2') : layerData.color;
+        const isSelected = selectedObjects.some(o => o.type === 'polyline' && o.plIndex === i) || 
+                           (currentTool === 'move' && moveSelection.some(s => s.type === 'polyline' && s.index === i)) ||
+                           (currentTool === 'rotate' && rotateSelection.some(s => s.type === 'polyline' && s.index === i));
+        let selColor = '#4a90e2';
+        if (currentTool === 'move') selColor = '#ffa500';
+        else if (currentTool === 'rotate') selColor = '#ff00ff';
+        ctx.strokeStyle = isSelected ? selColor : layerData.color;
         ctx.lineWidth = isSelected ? 2 : 1;
         ctx.beginPath();
-        for (let j = 0; j < pl.points.length; j++) {
-            const sp = worldToScreen(pl.points[j].x, pl.points[j].y);
-            if (j === 0) ctx.moveTo(sp.x, sp.y); else ctx.lineTo(sp.x, sp.y);
+        if (pl.points.length > 0) {
+            const sp0 = worldToScreen(pl.points[0].x, pl.points[0].y);
+            ctx.moveTo(sp0.x, sp0.y);
+            for (let j = 0; j < pl.points.length; j++) {
+                let nextIdx = j + 1;
+                if (nextIdx === pl.points.length) {
+                    if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                    else continue;
+                }
+                const p1 = pl.points[j];
+                const p2 = pl.points[nextIdx];
+                if (p1.bulge && p1.bulge !== 0) {
+                    const arc = getArcParams(p1, p2, p1.bulge);
+                    if (arc) {
+                        const scx = worldToScreen(arc.cx, arc.cy);
+                        ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                    } else {
+                        const sp2 = worldToScreen(p2.x, p2.y);
+                        ctx.lineTo(sp2.x, sp2.y);
+                    }
+                } else {
+                    const sp2 = worldToScreen(p2.x, p2.y);
+                    ctx.lineTo(sp2.x, sp2.y);
+                }
+            }
         }
-        if (pl.closed && pl.points.length > 2) ctx.closePath();
         ctx.stroke();
     }
     
@@ -1351,7 +2232,7 @@ function draw() {
         const lbl = labels[i]; const layerData = layers[lbl.layer] || layers['0'];
         if (!layerData.visible) continue;
         const segData = getSegmentData(lbl.plIndex, lbl.segmentIndex); if (!segData) continue;
-        const midX = (segData.p1.x + segData.p2.x) / 2; const midY = (segData.p1.y + segData.p2.y) / 2;
+        const midX = segData.midX; const midY = segData.midY;
         const sp = worldToScreen(midX, midY);
         let prec = lbl.precision !== undefined ? lbl.precision : (documentSettings.lblPrecision !== undefined ? documentSettings.lblPrecision : 2);
         let text = lbl.text.replace('#longitud#', segData.len.toFixed(prec)); text = text.replace('#capa#', segData.layer);
@@ -1360,9 +2241,16 @@ function draw() {
         if (angle > Math.PI/2 || angle < -Math.PI/2) angle += Math.PI;
         ctx.save(); ctx.translate(sp.x, sp.y); ctx.rotate(angle);
         ctx.font = '14px Inter'; const metrics = ctx.measureText(text);
-        const isSelected = (selectedObject && selectedObject.type === 'label' && selectedObject.index === i) ||
-                           (currentTool === 'move' && moveSelection.some(s => s.type === 'label' && s.index === i));
-        if (isSelected) { ctx.fillStyle = currentTool === 'move' ? 'rgba(255, 165, 0, 0.3)' : 'rgba(74, 144, 226, 0.3)'; ctx.fillRect(-metrics.width/2 - 4, - 12 - 4 - 5, metrics.width + 8, 20); }
+        const isSelected = selectedObjects.some(o => o.type === 'label' && o.index === i) ||
+                           (currentTool === 'move' && moveSelection.some(s => s.type === 'label' && s.index === i)) ||
+                           (currentTool === 'rotate' && rotateSelection.some(s => s.type === 'label' && s.index === i));
+        if (isSelected) {
+            let bgCol = 'rgba(74, 144, 226, 0.3)';
+            if (currentTool === 'move') bgCol = 'rgba(255, 165, 0, 0.3)';
+            else if (currentTool === 'rotate') bgCol = 'rgba(255, 0, 255, 0.3)';
+            ctx.fillStyle = bgCol;
+            ctx.fillRect(-metrics.width/2 - 4, - 12 - 4 - 5, metrics.width + 8, 20);
+        }
         ctx.fillStyle = layerData.color; ctx.textAlign = 'center'; ctx.fillText(text, 0, -5);
         ctx.restore();
     }
@@ -1371,13 +2259,72 @@ function draw() {
     if (currentTool === 'polyline' && currentPolyline && currentPolyline.points.length > 0) {
         const layerData = layers[currentLayer];
         ctx.strokeStyle = layerData ? layerData.color : '#ffffff'; ctx.lineWidth = 1.5; ctx.beginPath();
-        for (let i = 0; i < currentPolyline.points.length; i++) {
-            const sp = worldToScreen(currentPolyline.points[i].x, currentPolyline.points[i].y);
-            if (i === 0) ctx.moveTo(sp.x, sp.y); else ctx.lineTo(sp.x, sp.y);
+        const sp0 = worldToScreen(currentPolyline.points[0].x, currentPolyline.points[0].y);
+        ctx.moveTo(sp0.x, sp0.y);
+        for (let i = 0; i < currentPolyline.points.length - 1; i++) {
+            const p1 = currentPolyline.points[i];
+            const p2 = currentPolyline.points[i+1];
+            if (p1.bulge && p1.bulge !== 0) {
+                const arc = getArcParams(p1, p2, p1.bulge);
+                if (arc) {
+                    const scx = worldToScreen(arc.cx, arc.cy);
+                    ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                } else {
+                    const sp2 = worldToScreen(p2.x, p2.y);
+                    ctx.lineTo(sp2.x, sp2.y);
+                }
+            } else {
+                const sp2 = worldToScreen(p2.x, p2.y);
+                ctx.lineTo(sp2.x, sp2.y);
+            }
         }
-        const cursorPos = worldToScreen(worldX, worldY); ctx.lineTo(cursorPos.x, cursorPos.y); ctx.stroke();
+        
         const lastPoint = currentPolyline.points[currentPolyline.points.length - 1];
+        
+        // Calculate tangent bulge
+        if (polylineMode === 'arc') {
+            let startDirAngle = 0;
+            if (currentPolyline.points.length >= 2) {
+                const prevPoint = currentPolyline.points[currentPolyline.points.length - 2];
+                if (prevPoint.bulge) {
+                    const params = getArcParams(prevPoint, lastPoint, prevPoint.bulge);
+                    if (params) {
+                        const radAngle = Math.atan2(lastPoint.y - params.cy, lastPoint.x - params.cx);
+                        startDirAngle = params.ccw ? radAngle + Math.PI/2 : radAngle - Math.PI/2;
+                    } else {
+                        startDirAngle = Math.atan2(lastPoint.y - prevPoint.y, lastPoint.x - prevPoint.x);
+                    }
+                } else {
+                    startDirAngle = Math.atan2(lastPoint.y - prevPoint.y, lastPoint.x - prevPoint.x);
+                }
+            } else {
+                startDirAngle = 0;
+            }
+            
+            const chordAngle = Math.atan2(worldY - lastPoint.y, worldX - lastPoint.x);
+            let theta = chordAngle - startDirAngle;
+            while(theta < -Math.PI) theta += 2*Math.PI;
+            while(theta > Math.PI) theta -= 2*Math.PI;
+            currentPreviewBulge = Math.tan(theta / 2);
+        } else {
+            currentPreviewBulge = 0;
+        }
+
+        if (currentPreviewBulge !== 0) {
+            const arc = getArcParams(lastPoint, {x: worldX, y: worldY}, currentPreviewBulge);
+            if (arc) {
+                const scx = worldToScreen(arc.cx, arc.cy);
+                ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+            } else {
+                const cursorPos = worldToScreen(worldX, worldY); ctx.lineTo(cursorPos.x, cursorPos.y);
+            }
+        } else {
+            const cursorPos = worldToScreen(worldX, worldY); ctx.lineTo(cursorPos.x, cursorPos.y);
+        }
+        ctx.stroke();
+        
         const lastPointSp = worldToScreen(lastPoint.x, lastPoint.y);
+        const cursorPos = worldToScreen(worldX, worldY);
         const dx = worldX - lastPoint.x; const dy = worldY - lastPoint.y; const length = Math.hypot(dx, dy);
         ctx.font = '12px Inter'; const midX = (lastPointSp.x + cursorPos.x) / 2; const midY = (lastPointSp.y + cursorPos.y) / 2;
         const text = length.toFixed(2); const textMetrics = ctx.measureText(text);
@@ -1424,11 +2371,32 @@ function draw() {
                 for (let i = startI; i <= numCopies; i++) {
                     const offset = { x: vectorOffset.x * i, y: vectorOffset.y * i };
                     ctx.beginPath();
-                    for (let j = 0; j < pl.points.length; j++) {
-                        const sp = worldToScreen(pl.points[j].x + offset.x, pl.points[j].y + offset.y);
-                        if (j === 0) ctx.moveTo(sp.x, sp.y); else ctx.lineTo(sp.x, sp.y);
+                    if (pl.points.length > 0) {
+                        const sp0 = worldToScreen(pl.points[0].x + offset.x, pl.points[0].y + offset.y);
+                        ctx.moveTo(sp0.x, sp0.y);
+                        for (let k = 0; k < pl.points.length; k++) {
+                            let nextIdx = k + 1;
+                            if (nextIdx === pl.points.length) {
+                                if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                                else continue;
+                            }
+                            const p1 = { x: pl.points[k].x + offset.x, y: pl.points[k].y + offset.y, bulge: pl.points[k].bulge };
+                            const p2 = { x: pl.points[nextIdx].x + offset.x, y: pl.points[nextIdx].y + offset.y, bulge: pl.points[nextIdx].bulge };
+                            if (p1.bulge && p1.bulge !== 0) {
+                                const arc = getArcParams(p1, p2, p1.bulge);
+                                if (arc) {
+                                    const scx = worldToScreen(arc.cx, arc.cy);
+                                    ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                                } else {
+                                    const sp2 = worldToScreen(p2.x, p2.y);
+                                    ctx.lineTo(sp2.x, sp2.y);
+                                }
+                            } else {
+                                const sp2 = worldToScreen(p2.x, p2.y);
+                                ctx.lineTo(sp2.x, sp2.y);
+                            }
+                        }
                     }
-                    if (pl.closed && pl.points.length > 2) ctx.closePath();
                     ctx.stroke();
                 }
             }
@@ -1443,11 +2411,212 @@ function draw() {
         ctx.fillStyle = isCopyMode ? '#00ff00' : '#ffa500'; ctx.textAlign = 'left'; ctx.fillText(text, spOrigin.x + 14, spOrigin.y - 8);
     }
     
-    // 6. Draw Snapping
+    // Rotate Tool Preview
+    if (currentTool === 'rotate' && rotateState === 'REFERENCE' && rotateOrigin) {
+        ctx.strokeStyle = '#ff00ff'; ctx.lineWidth = 1; ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        const spOrigin = worldToScreen(rotateOrigin.x, rotateOrigin.y);
+        const cursorPos = worldToScreen(worldX, worldY);
+        ctx.moveTo(spOrigin.x, spOrigin.y); ctx.lineTo(cursorPos.x, cursorPos.y);
+        ctx.stroke(); ctx.setLineDash([]);
+        
+        ctx.font = '12px Inter'; const text = "Referencia";
+        const textMetrics = ctx.measureText(text);
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(cursorPos.x + 10, cursorPos.y - 20, textMetrics.width + 8, 16);
+        ctx.fillStyle = '#ff00ff'; ctx.textAlign = 'left'; ctx.fillText(text, cursorPos.x + 14, cursorPos.y - 8);
+    }
+
+    if (currentTool === 'rotate' && (rotateState === 'ANGLE' || rotateState === 'ADJUSTING') && rotateOrigin) {
+        let currentTargetX = worldX;
+        let currentTargetY = worldY;
+        if (rotateState === 'ADJUSTING' && rotateTargetPoint) {
+            currentTargetX = rotateTargetPoint.x;
+            currentTargetY = rotateTargetPoint.y;
+        }
+        const targetAngle = Math.atan2(currentTargetY - rotateOrigin.y, currentTargetX - rotateOrigin.x);
+        let refAngle = 0;
+        if (rotateReference) {
+            refAngle = Math.atan2(rotateReference.y - rotateOrigin.y, rotateReference.x - rotateOrigin.x);
+        }
+        let rad = targetAngle - refAngle;
+        while (rad > Math.PI) rad -= 2 * Math.PI;
+        while (rad <= -Math.PI) rad += 2 * Math.PI;
+        let numCopies = 1;
+        let angleOffset = rad;
+        let mode = 'normal';
+
+        if (rotateModifier.startsWith('/')) {
+            const n = parseInt(rotateModifier.substring(1));
+            if (!isNaN(n) && n > 0) { numCopies = n; angleOffset = rad / n; mode = 'divide'; }
+        } else if (rotateModifier.startsWith('*')) {
+            const n = parseInt(rotateModifier.substring(1));
+            if (!isNaN(n) && n > 0) { numCopies = n; mode = 'multiply'; }
+        }
+        
+        if (isCopyMode && mode === 'normal') numCopies = 1;
+        else if (!isCopyMode && mode === 'normal') numCopies = 1;
+        
+        rotateSelection.forEach(sel => {
+            if (sel.type === 'polyline') {
+                const pl = polylines[sel.index];
+                ctx.strokeStyle = isCopyMode ? 'rgba(0, 255, 255, 0.5)' : 'rgba(255, 0, 255, 0.5)';
+                ctx.lineWidth = 2;
+                
+                let startI = (!isCopyMode && mode === 'normal') ? 1 : 1;
+                
+                for (let i = startI; i <= numCopies; i++) {
+                    const currentAngle = (mode === 'divide') ? (angleOffset * i) : (angleOffset * i);
+                    ctx.beginPath();
+                    if (pl.points.length > 0) {
+                        const rp0 = rotatePoint(pl.points[0].x, pl.points[0].y, currentAngle, rotateOrigin.x, rotateOrigin.y);
+                        const sp0 = worldToScreen(rp0.x, rp0.y);
+                        ctx.moveTo(sp0.x, sp0.y);
+                        for (let k = 0; k < pl.points.length; k++) {
+                            let nextIdx = k + 1;
+                            if (nextIdx === pl.points.length) {
+                                if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                                else continue;
+                            }
+                            
+                            const rpk = rotatePoint(pl.points[k].x, pl.points[k].y, currentAngle, rotateOrigin.x, rotateOrigin.y);
+                            const rpnext = rotatePoint(pl.points[nextIdx].x, pl.points[nextIdx].y, currentAngle, rotateOrigin.x, rotateOrigin.y);
+                            
+                            const p1 = { x: rpk.x, y: rpk.y, bulge: pl.points[k].bulge };
+                            const p2 = { x: rpnext.x, y: rpnext.y, bulge: pl.points[nextIdx].bulge };
+                            if (p1.bulge && p1.bulge !== 0) {
+                                const arc = getArcParams(p1, p2, p1.bulge);
+                                if (arc) {
+                                    const scx = worldToScreen(arc.cx, arc.cy);
+                                    ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                                } else {
+                                    const sp2 = worldToScreen(p2.x, p2.y);
+                                    ctx.lineTo(sp2.x, sp2.y);
+                                }
+                            } else {
+                                const sp2 = worldToScreen(p2.x, p2.y);
+                                ctx.lineTo(sp2.x, sp2.y);
+                            }
+                        }
+                    }
+                    ctx.stroke();
+                }
+            }
+        });
+        
+        // Draw angle tag and origin
+        const deg = (rad * 180 / Math.PI);
+        ctx.font = '12px Inter'; const text = "ang: " + deg.toFixed(2) + "°" + (isCopyMode ? " (Copy)" : " (Rot)") + (rotateModifier ? " ["+rotateModifier+"]" : "");
+        const textMetrics = ctx.measureText(text);
+        const spOrigin = worldToScreen(rotateOrigin.x, rotateOrigin.y);
+        const cursorPos = worldToScreen(worldX, worldY);
+        
+        // draw origin cross
+        ctx.strokeStyle = '#ff00ff'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(spOrigin.x - 5, spOrigin.y); ctx.lineTo(spOrigin.x + 5, spOrigin.y);
+        ctx.moveTo(spOrigin.x, spOrigin.y - 5); ctx.lineTo(spOrigin.x, spOrigin.y + 5); ctx.stroke();
+        
+        // draw reference and target line
+        if (rotateReference) {
+            ctx.setLineDash([5, 5]);
+            const rp = rotatePoint(rotateReference.x, rotateReference.y, rad, rotateOrigin.x, rotateOrigin.y);
+            const spRef = worldToScreen(rp.x, rp.y);
+            ctx.beginPath(); ctx.moveTo(spOrigin.x, spOrigin.y); ctx.lineTo(spRef.x, spRef.y); ctx.stroke();
+            ctx.setLineDash([]);
+        }
+        
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(cursorPos.x + 10, cursorPos.y - 20, textMetrics.width + 8, 16);
+        ctx.fillStyle = isCopyMode ? '#00ffff' : '#ff00ff'; ctx.textAlign = 'left'; ctx.fillText(text, cursorPos.x + 14, cursorPos.y - 8);
+    }
+    
+    // 6. Draw Grips if selected
+    if (selectedObjects.some(o => o.type === 'polyline')) {
+        const pl = polylines[(selectedObjects.find(o => o.type === 'polyline') || {}).plIndex];
+        const gripSize = 8;
+        for (let j = 0; j < pl.points.length; j++) {
+            ctx.fillStyle = '#4a90e2';
+            const sp = worldToScreen(pl.points[j].x, pl.points[j].y);
+            ctx.fillRect(sp.x - gripSize/2, sp.y - gripSize/2, gripSize, gripSize);
+            
+            let nextIdx = j + 1;
+            if (nextIdx === pl.points.length) {
+                if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                else continue;
+            }
+            const p1 = pl.points[j]; const p2 = pl.points[nextIdx];
+            let midSp;
+            if (p1.bulge && p1.bulge !== 0) {
+                const params = getArcParams(p1, p2, p1.bulge);
+                if (params) {
+                    const midW = getArcMidpoint(params);
+                    midSp = worldToScreen(midW.x, midW.y);
+                } else {
+                    midSp = worldToScreen((p1.x + p2.x)/2, (p1.y + p2.y)/2);
+                }
+            } else {
+                midSp = worldToScreen((p1.x + p2.x)/2, (p1.y + p2.y)/2);
+            }
+            ctx.fillStyle = '#00ffff';
+            ctx.fillRect(midSp.x - gripSize/2, midSp.y - gripSize/2, gripSize, gripSize);
+        }
+    }
+    
+    // 7. Draw Snapping
     if (snapPoint && typedLength === '') {
         const sp = worldToScreen(snapPoint.x, snapPoint.y);
-        ctx.strokeStyle = '#ffff00'; ctx.lineWidth = 2; const size = 6;
-        ctx.strokeRect(sp.x - size/2, sp.y - size/2, size, size);
+        ctx.strokeStyle = snapPoint.type === 'grid' ? workspaceSettings.grid.color : '#00ff00'; 
+        ctx.lineWidth = 2;
+        const size = 10;
+        ctx.beginPath();
+        if (snapPoint.type === 'endpoint') {
+            ctx.strokeRect(sp.x - size/2, sp.y - size/2, size, size);
+        } else if (snapPoint.type === 'midpoint') {
+            ctx.moveTo(sp.x, sp.y - size/2);
+            ctx.lineTo(sp.x + size/2, sp.y + size/2);
+            ctx.lineTo(sp.x - size/2, sp.y + size/2);
+            ctx.closePath();
+            ctx.stroke();
+        } else if (snapPoint.type === 'center') {
+            ctx.arc(sp.x, sp.y, size/2, 0, Math.PI*2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(sp.x - size/2 - 2, sp.y); ctx.lineTo(sp.x + size/2 + 2, sp.y);
+            ctx.moveTo(sp.x, sp.y - size/2 - 2); ctx.lineTo(sp.x, sp.y + size/2 + 2);
+            ctx.stroke();
+        } else if (snapPoint.type === 'perpendicular') {
+            ctx.moveTo(sp.x - size/2, sp.y - size/2);
+            ctx.lineTo(sp.x - size/2, sp.y + size/2);
+            ctx.lineTo(sp.x + size/2, sp.y + size/2);
+            ctx.stroke();
+        } else if (snapPoint.type === 'extension') {
+            ctx.moveTo(sp.x - size/2, sp.y - size/2);
+            ctx.lineTo(sp.x + size/2, sp.y + size/2);
+            ctx.moveTo(sp.x + size/2, sp.y - size/2);
+            ctx.lineTo(sp.x - size/2, sp.y + size/2);
+            ctx.stroke();
+            
+            if (snapPoint.data) {
+                const sp1 = worldToScreen(snapPoint.data.p1.x, snapPoint.data.p1.y);
+                const sp2 = worldToScreen(snapPoint.data.p2.x, snapPoint.data.p2.y);
+                const d1 = Math.hypot(sp.x - sp1.x, sp.y - sp1.y);
+                const d2 = Math.hypot(sp.x - sp2.x, sp.y - sp2.y);
+                const spTarget = d1 < d2 ? sp1 : sp2;
+                ctx.save();
+                ctx.beginPath();
+                ctx.setLineDash([4, 4]);
+                ctx.moveTo(sp.x, sp.y);
+                ctx.lineTo(spTarget.x, spTarget.y);
+                ctx.stroke();
+                ctx.restore();
+            }
+        } else if (snapPoint.type === 'intersection' || snapPoint.type === 'grid') {
+            ctx.moveTo(sp.x - size/2, sp.y - size/2);
+            ctx.lineTo(sp.x + size/2, sp.y + size/2);
+            ctx.moveTo(sp.x + size/2, sp.y - size/2);
+            ctx.lineTo(sp.x - size/2, sp.y + size/2);
+            ctx.stroke();
+        } else {
+            ctx.strokeRect(sp.x - size/2, sp.y - size/2, size, size);
+        }
     }
     
     // 7. Draw Crosshair
@@ -1460,13 +2629,13 @@ function draw() {
     // 8. Draw Page UI Controls (Anchors and Icons) always on top!
     pages.forEach((p, idx) => {
         const spAnchor = worldToScreen(p.x, p.y);
-        ctx.fillStyle = (selectedPageIdx === idx) ? '#ff4444' : '#4a90e2';
+        ctx.fillStyle = (selectedObjects.some(o => o.type === 'page' && o.index === idx)) ? '#ff4444' : '#4a90e2';
         ctx.beginPath();
         ctx.arc(spAnchor.x, spAnchor.y, 4, 0, Math.PI*2);
         ctx.fill();
         
         if (currentTool === 'select') {
-            ctx.strokeStyle = (selectedPageIdx === idx) ? '#ff4444' : '#4a90e2';
+            ctx.strokeStyle = (selectedObjects.some(o => o.type === 'page' && o.index === idx)) ? '#ff4444' : '#4a90e2';
             ctx.lineWidth = 1.5;
             ctx.fillStyle = p.bgColor ? p.bgColor : '#ffffff'; // Fallback to white if no bg
             ctx.beginPath();
@@ -1611,7 +2780,7 @@ async function generatePDF() {
             const layerData = layers[lbl.layer || '0'];
             if (!layerData || !layerData.visible) continue;
             const segData = getSegmentData(lbl.plIndex, lbl.segmentIndex); if (!segData) continue;
-            const midX = (segData.p1.x + segData.p2.x) / 2; const midY = (segData.p1.y + segData.p2.y) / 2;
+            const midX = segData.midX; const midY = segData.midY;
             const sp = offWorldToScreen(midX, midY);
             let prec = lbl.precision !== undefined ? lbl.precision : (documentSettings.lblPrecision !== undefined ? documentSettings.lblPrecision : 2);
             let text = lbl.text.replace('#longitud#', segData.len.toFixed(prec)); text = text.replace('#capa#', segData.layer);
@@ -1646,6 +2815,62 @@ async function generatePDF() {
     }
 }
 
+function commitRotate(worldX, worldY, fixedAngle = null) {
+    if (rotateSelection.length === 0 || !rotateOrigin) {
+        rotateState = 'SELECTING'; rotateSelection = []; rotateModifier = ''; draw(); return;
+    }
+    
+    let rad = 0;
+    if (fixedAngle !== null) {
+        rad = fixedAngle * Math.PI / 180;
+    } else {
+        const targetAngle = Math.atan2(worldY - rotateOrigin.y, worldX - rotateOrigin.x);
+        let refAngle = 0;
+        if (rotateReference) {
+            refAngle = Math.atan2(rotateReference.y - rotateOrigin.y, rotateReference.x - rotateOrigin.x);
+        }
+        rad = targetAngle - refAngle;
+        while (rad > Math.PI) rad -= 2 * Math.PI;
+        while (rad <= -Math.PI) rad += 2 * Math.PI;
+    }
+    
+    let numCopies = 1;
+    let angleOffset = rad;
+    let mode = 'normal';
+
+    if (rotateModifier.startsWith('/')) {
+        const n = parseInt(rotateModifier.substring(1));
+        if (!isNaN(n) && n > 0) { numCopies = n; angleOffset = rad / n; mode = 'divide'; }
+    } else if (rotateModifier.startsWith('*')) {
+        const n = parseInt(rotateModifier.substring(1));
+        if (!isNaN(n) && n > 0) { numCopies = n; mode = 'multiply'; }
+    }
+    
+    for (let c = 1; c <= numCopies; c++) {
+        let currentAngle = (mode === 'divide') ? (angleOffset * c) : (angleOffset * c);
+        
+        rotateSelection.forEach(item => {
+            if (item.type === 'polyline') {
+                const pl = polylines[item.index];
+                const newPts = pl.points.map(p => {
+                    const rot = rotatePoint(p.x, p.y, currentAngle, rotateOrigin.x, rotateOrigin.y);
+                    return { x: rot.x, y: rot.y, bulge: p.bulge };
+                });
+                if (isCopyMode) polylines.push({ layer: pl.layer, closed: pl.closed, points: newPts });
+                else pl.points = newPts;
+            } else if (item.type === 'label') {
+                const lbl = labels[item.index];
+                if (isCopyMode) labels.push({ text: lbl.text, plIndex: (isCopyMode && item.type==='polyline') ? polylines.length-1 : lbl.plIndex, segmentIndex: lbl.segmentIndex, layer: lbl.layer });
+            }
+        });
+    }
+    
+    const isCopy = isCopyMode;
+    rotateState = 'SELECTING'; rotateSelection = []; rotateOrigin = null; rotateReference = null; rotateModifier = ''; rotateCommandInput = ''; isCopyMode = false;
+    commitTimeMap(isCopy ? 'Copiar (Rotación)' : 'Rotar');
+    draw();
+}
+
 function commitMoveCopy() {
     if (moveSelection.length === 0 || !moveOrigin || !moveDest) {
         moveState = 'SELECTING'; moveSelection = []; moveModifier = ''; draw(); return;
@@ -1678,11 +2903,11 @@ function commitMoveCopy() {
         if (sel.type === 'polyline') {
             const pl = polylines[sel.index];
             if (!isCopyMode && mode === 'normal') {
-                pl.points = pl.points.map(p => ({ x: p.x + vectorOffset.x, y: p.y + vectorOffset.y }));
+                pl.points = pl.points.map(p => ({ ...p, x: p.x + vectorOffset.x, y: p.y + vectorOffset.y }));
             } else {
                 for (let i = 1; i <= numCopies; i++) {
                     const offset = { x: vectorOffset.x * i, y: vectorOffset.y * i };
-                    newPolylines.push({ layer: pl.layer, closed: pl.closed, points: pl.points.map(p => ({ x: p.x + offset.x, y: p.y + offset.y })) });
+                    newPolylines.push({ layer: pl.layer, closed: pl.closed, points: pl.points.map(p => ({ ...p, x: p.x + offset.x, y: p.y + offset.y })) });
                 }
                 if (mode === 'divide' || mode === 'multiply') { // Also copy the original to the end position if divide? Wait, if multiply, we just do i=1 to n.
                     // If divide, n copies IN BETWEEN, but the user expects the final one at destination? 
@@ -1697,6 +2922,7 @@ function commitMoveCopy() {
         polylines = polylines.concat(newPolylines);
     }
     
+    const isCopy = isCopyMode;
     moveState = 'SELECTING';
     moveSelection = [];
     moveOrigin = null;
@@ -1705,5 +2931,410 @@ function commitMoveCopy() {
     moveCommandInput = '';
     isCopyMode = false;
     document.getElementById('length-input-overlay').style.display = 'none';
+    commitTimeMap(isCopy ? 'Copiar' : 'Mover');
     draw();
+}
+
+// Initial commit
+commitTimeMap('Dibujo inicial');
+
+// Time Map UI Logic
+const tmPanel = document.getElementById("time-map-panel");
+const tmToggle = document.getElementById("time-map-toggle");
+const tmToggleIcon = document.getElementById("time-map-toggle-icon");
+const tmSvg = document.getElementById("time-map-svg");
+const btnTagNode = document.getElementById("btn-tag-node");
+const btnToggleOracle = document.getElementById("btn-toggle-oracle");
+
+let isTmExpanded = false;
+
+
+if(tmToggle) {
+    tmToggle.addEventListener("click", () => {
+        isTmExpanded = !isTmExpanded;
+        if (isTmExpanded) {
+            tmPanel.classList.remove("time-map-collapsed");
+            tmPanel.classList.add("time-map-expanded");
+            tmToggleIcon.innerHTML = `<polyline points="18 9 12 15 6 9"></polyline>`;
+            renderTimeMapSVG();
+        } else {
+            tmPanel.classList.remove("time-map-expanded");
+            tmPanel.classList.add("time-map-collapsed");
+            tmToggleIcon.innerHTML = `<polyline points="18 15 12 9 6 15"></polyline>`;
+        }
+    });
+}
+
+if(btnTagNode) {
+    btnTagNode.addEventListener("click", () => {
+        if (!timeMap.activeNodeId) return;
+        const currentTag = timeMap.nodes[timeMap.activeNodeId].tag || "";
+        const newTag = prompt("Etiqueta para este momento:", currentTag);
+        if (newTag !== null) {
+            tagCurrentNode(newTag.trim());
+        }
+    });
+}
+
+if (btnToggleOracle) {
+    btnToggleOracle.addEventListener("click", () => {
+        isOracleActive = !isOracleActive;
+        if (isOracleActive) {
+            btnToggleOracle.style.background = "#00bcd4";
+            btnToggleOracle.style.color = "#000";
+        } else {
+            btnToggleOracle.style.background = "#333";
+            btnToggleOracle.style.color = "white";
+        }
+        draw();
+        if (window.renderTimeMapSVG) window.renderTimeMapSVG();
+    });
+}
+
+// Create tooltip div
+const tmTooltip = document.createElement("div");
+tmTooltip.className = "tm-tooltip";
+document.body.appendChild(tmTooltip);
+
+function calculateGraphLayout() {
+    const nodes = timeMap.nodes;
+    if (Object.keys(nodes).length === 0) return { layouts: {}, maxDepth: 0, maxRow: 0 };
+
+    const trunkIds = new Set();
+    let currentId = timeMap.activeNodeId;
+    while (currentId) {
+        trunkIds.add(currentId);
+        currentId = nodes[currentId].parentId;
+    }
+
+    const layouts = {}; 
+    const depths = {};
+    const getDepth = (id) => {
+        if (depths[id] !== undefined) return depths[id];
+        if (!nodes[id].parentId) {
+            depths[id] = 0;
+            return 0;
+        }
+        const d = getDepth(nodes[id].parentId) + 1;
+        depths[id] = d;
+        return d;
+    };
+    
+    for (let id in nodes) getDepth(id);
+
+    const childrenMap = {};
+    for (let id in nodes) childrenMap[id] = [];
+    for (let id in nodes) {
+        const pid = nodes[id].parentId;
+        if (pid && childrenMap[pid]) {
+            childrenMap[pid].push({ id: id, ts: nodes[id].timestamp });
+        }
+    }
+    for (let id in childrenMap) {
+        childrenMap[id].sort((a, b) => a.ts - b.ts);
+    }
+
+    let nextAvailableRow = 1;
+
+    const assignRow = (id, row) => {
+        layouts[id] = { depth: depths[id], row: row };
+        
+        const children = childrenMap[id] || [];
+        let trunkChild = null;
+        const otherChildren = [];
+        
+        for (let child of children) {
+            if (trunkIds.has(child.id)) {
+                trunkChild = child.id;
+            } else {
+                otherChildren.push(child.id);
+            }
+        }
+        
+        if (trunkChild) {
+            assignRow(trunkChild, row);
+        } else if (otherChildren.length > 0) {
+            const cont = otherChildren.pop();
+            assignRow(cont, row);
+        }
+        
+        for (let child of otherChildren) {
+            assignRow(child, nextAvailableRow++);
+        }
+    };
+    
+    for (let id in nodes) {
+        if (!nodes[id].parentId) {
+            if (trunkIds.has(id)) {
+                assignRow(id, 0);
+            } else {
+                assignRow(id, nextAvailableRow++);
+            }
+        }
+    }
+
+    let maxDepth = 0;
+    for (let id in layouts) {
+        if (layouts[id].depth > maxDepth) maxDepth = layouts[id].depth;
+    }
+
+    return { layouts, maxDepth, maxRow: nextAvailableRow - 1 };
+}
+
+window.renderTimeMapSVG = function() {
+    if (!isTmExpanded || !tmSvg) return;
+    const { layouts, maxDepth, maxRow } = calculateGraphLayout();
+    let oracleData = null;
+    if (isOracleActive && timeMap.activeNodeId) { oracleData = getFuturePaths(timeMap.activeNodeId); }
+    
+    const nodeSpacingX = 60;
+    const nodeSpacingY = 40;
+    const paddingX = 40;
+    const paddingY = 40;
+    
+    const width = Math.max(tmPanel.clientWidth, maxDepth * nodeSpacingX + paddingX * 2);
+    const height = Math.max(200, maxRow * nodeSpacingY + paddingY * 2);
+    
+    tmSvg.setAttribute("width", width);
+    tmSvg.setAttribute("height", height);
+    
+    tmSvg.innerHTML = "";
+    
+    const nodes = timeMap.nodes;
+    for (let id in nodes) {
+        const node = nodes[id];
+        if (node.parentId && layouts[node.parentId]) {
+            const pLayout = layouts[node.parentId];
+            const cLayout = layouts[id];
+            
+            const x1 = paddingX + pLayout.depth * nodeSpacingX;
+            const y1 = paddingY + pLayout.row * nodeSpacingY;
+            const x2 = paddingX + cLayout.depth * nodeSpacingX;
+            const y2 = paddingY + cLayout.row * nodeSpacingY;
+            
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            const d = `M ${x1} ${y1} C ${x1 + nodeSpacingX/2} ${y1}, ${x2 - nodeSpacingX/2} ${y2}, ${x2} ${y2}`;
+            path.setAttribute("d", d);
+            path.setAttribute("class", "tm-link");
+            
+            const hue = cLayout.node ? (cLayout.node.hue || 200) : (timeMap.nodes[id].hue || 200);
+            if (oracleData && oracleData.activeFutures.has(id)) {
+                path.setAttribute("stroke", `hsla(${hue}, 90%, 60%, 0.8)`);
+                path.setAttribute("stroke-width", "3");
+            } else if (cLayout.row === 0 && pLayout.row === 0) {
+                path.setAttribute("stroke", `hsl(${hue}, 70%, 50%)`);
+            } else {
+                path.setAttribute("stroke", `hsl(${hue}, 30%, 40%)`);
+            }
+            tmSvg.appendChild(path);
+        }
+    }
+    
+    for (let id in nodes) {
+        const node = nodes[id];
+        const l = layouts[id];
+        const cx = paddingX + l.depth * nodeSpacingX;
+        const cy = paddingY + l.row * nodeSpacingY;
+        
+        const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("cx", cx);
+        circle.setAttribute("cy", cy);
+        circle.setAttribute("r", id === timeMap.activeNodeId ? 7 : 5);
+        circle.setAttribute("class", "tm-node");
+        
+        const hue = node.hue || 200;
+        circle.setAttribute("stroke", `hsl(${hue}, 70%, 50%)`);
+        circle.setAttribute("stroke-width", "2");
+        if (oracleData && oracleData.activeFutures.has(id)) {
+            circle.setAttribute("stroke-width", "3");
+        }
+
+        if (id === timeMap.activeNodeId) {
+            circle.setAttribute("fill", "#ffffff");
+            circle.setAttribute("stroke-width", "3");
+        } else if (node.tag) {
+            circle.setAttribute("fill", "#ff9800"); 
+        } else {
+            circle.setAttribute("fill", "#1a1a1a");
+        }
+        
+        circle.addEventListener("mouseenter", (e) => {
+            tmTooltip.style.display = "block";
+            let txt = node.message;
+            if (node.tag) txt = `[${node.tag}] ${txt}`;
+            if (id === timeMap.activeNodeId) txt += " (Actual)";
+            tmTooltip.textContent = txt;
+            tmTooltip.style.left = (e.pageX + 10) + "px";
+            tmTooltip.style.top = (e.pageY + 10) + "px";
+        });
+        circle.addEventListener("mousemove", (e) => {
+            tmTooltip.style.left = (e.pageX + 10) + "px";
+            tmTooltip.style.top = (e.pageY + 10) + "px";
+        });
+        circle.addEventListener("mouseleave", () => {
+            tmTooltip.style.display = "none";
+        });
+        
+        circle.addEventListener("click", () => {
+            if (id !== timeMap.activeNodeId) {
+                checkoutNode(id);
+            }
+        });
+        
+        tmSvg.appendChild(circle);
+        
+        if (node.tag) {
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", cx);
+            text.setAttribute("y", cy - 12);
+            text.setAttribute("fill", "#ff9800");
+            text.setAttribute("font-size", "10px");
+            text.setAttribute("text-anchor", "middle");
+            text.textContent = node.tag;
+            tmSvg.appendChild(text);
+        }
+    }
+    
+    setTimeout(() => {
+        const body = document.getElementById("time-map-body");
+        if(body) body.scrollLeft = width;
+    }, 10);
+};
+
+
+
+function getFuturePaths(startNodeId) {
+    if (!startNodeId || !timeMap.nodes[startNodeId]) return { primaryLeafId: null, secondaryLeafIds: [], activeFutures: new Set() };
+    
+    let paths = [];
+    function dfs(nodeId, currentPath) {
+        const node = timeMap.nodes[nodeId];
+        currentPath.push(nodeId);
+        if (node.childrenIds.length === 0) {
+            paths.push([...currentPath]);
+        } else {
+            node.childrenIds.forEach(childId => dfs(childId, currentPath));
+        }
+        currentPath.pop();
+    }
+    
+    const startNode = timeMap.nodes[startNodeId];
+    if (startNode.childrenIds.length === 0) return { primaryLeafId: null, secondaryLeafIds: [], activeFutures: new Set() };
+    
+    startNode.childrenIds.forEach(childId => dfs(childId, []));
+    paths.sort((a, b) => b.length - a.length);
+    
+    const activeFutures = new Set();
+    paths.forEach(p => p.forEach(id => activeFutures.add(id)));
+    
+    const primaryLeafId = paths[0][paths[0].length - 1];
+    const secondaryLeafIds = [];
+    for (let i = 1; i < paths.length; i++) secondaryLeafIds.push(paths[i][paths[i].length - 1]);
+    
+    return { primaryLeafId, secondaryLeafIds, activeFutures };
+}
+
+function renderStateElements(stateToDraw, overrideColor, globalAlpha) {
+    ctx.save();
+    if (globalAlpha !== undefined) ctx.globalAlpha = globalAlpha;
+
+    // Polylines
+    for (let i = 0; i < stateToDraw.polylines.length; i++) {
+        const pl = stateToDraw.polylines[i];
+        const layerData = layers[pl.layer]; // Current visibility rules
+        if (!layerData || !layerData.visible) continue;
+
+        ctx.strokeStyle = overrideColor || layerData.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        if (pl.points.length > 0) {
+            const sp0 = worldToScreen(pl.points[0].x, pl.points[0].y);
+            ctx.moveTo(sp0.x, sp0.y);
+            for (let j = 0; j < pl.points.length; j++) {
+                let nextIdx = j + 1;
+                if (nextIdx === pl.points.length) {
+                    if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                    else continue;
+                }
+                const p1 = pl.points[j];
+                const p2 = pl.points[nextIdx];
+                if (p1.bulge && p1.bulge !== 0) {
+                    const arc = getArcParams(p1, p2, p1.bulge);
+                    if (arc) {
+                        const scx = worldToScreen(arc.cx, arc.cy);
+                        ctx.arc(scx.x, scx.y, arc.R * scale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                    } else {
+                        const sp2 = worldToScreen(p2.x, p2.y);
+                        ctx.lineTo(sp2.x, sp2.y);
+                    }
+                } else {
+                    const sp2 = worldToScreen(p2.x, p2.y);
+                    ctx.lineTo(sp2.x, sp2.y);
+                }
+            }
+        }
+        ctx.stroke();
+    }
+    
+    // Labels
+    for (let i = 0; i < stateToDraw.labels.length; i++) {
+        const lbl = stateToDraw.labels[i]; 
+        const layerData = layers[lbl.layer] || layers['0'];
+        if (!layerData.visible) continue;
+        
+        let p1, p2, len;
+        const pl = stateToDraw.polylines[lbl.plIndex];
+        if (!pl) continue;
+        const j = lbl.segmentIndex;
+        let nextIdx = j + 1;
+        if (nextIdx === pl.points.length) { if (pl.closed) nextIdx = 0; else continue; }
+        p1 = pl.points[j]; p2 = pl.points[nextIdx];
+        
+        let midX, midY;
+        if (p1.bulge && p1.bulge !== 0) {
+            const arc = getArcParams(p1, p2, p1.bulge);
+            if (arc) { const m = getArcMidpoint(arc); midX = m.x; midY = m.y; len = Math.abs(arc.R * (arc.endAngle - arc.startAngle)); }
+            else { midX = (p1.x+p2.x)/2; midY = (p1.y+p2.y)/2; len = Math.hypot(p2.x-p1.x, p2.y-p1.y); }
+        } else { midX = (p1.x+p2.x)/2; midY = (p1.y+p2.y)/2; len = Math.hypot(p2.x-p1.x, p2.y-p1.y); }
+        
+        const sp = worldToScreen(midX, midY);
+        let prec = lbl.precision !== undefined ? lbl.precision : (documentSettings.lblPrecision !== undefined ? documentSettings.lblPrecision : 2);
+        let text = lbl.text.replace('#longitud#', len.toFixed(prec)).replace('#capa#', lbl.layer || '0');
+        const sp1 = worldToScreen(p1.x, p1.y); const sp2 = worldToScreen(p2.x, p2.y);
+        let angle = Math.atan2(sp2.y - sp1.y, sp2.x - sp1.x);
+        if (angle > Math.PI/2 || angle < -Math.PI/2) angle += Math.PI;
+        ctx.save(); ctx.translate(sp.x, sp.y); ctx.rotate(angle);
+        ctx.font = '14px Inter';
+        ctx.fillStyle = overrideColor || layerData.color; ctx.textAlign = 'center'; ctx.fillText(text, 0, -5);
+        ctx.restore();
+    }
+    
+    ctx.restore();
+}
+
+
+function assignHuesToGraph() {
+    let roots = [];
+    for (let id in timeMap.nodes) {
+        if (!timeMap.nodes[id].parentId) {
+            roots.push(id);
+        }
+    }
+    roots.forEach(rootId => {
+        if (timeMap.nodes[rootId].hue === undefined) {
+            timeMap.nodes[rootId].hue = 200;
+        }
+        function dfsHue(nodeId) {
+            const node = timeMap.nodes[nodeId];
+            node.childrenIds.forEach((childId, index) => {
+                const child = timeMap.nodes[childId];
+                if (child.hue === undefined) {
+                    if (index === 0) child.hue = node.hue;
+                    else child.hue = (node.hue + (45 * index)) % 360;
+                }
+                dfsHue(childId);
+            });
+        }
+        dfsHue(rootId);
+    });
 }

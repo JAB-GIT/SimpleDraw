@@ -22,6 +22,14 @@
 
             <div class="topbar-separator"></div>
 
+            <div class="topbar-section edit-tools">
+                <button id="btn-copy" class="icon-btn" title="Copiar (Ctrl+C)">📋</button>
+                <button id="btn-paste" class="icon-btn" title="Pegar (Ctrl+V)">📝</button>
+                <button id="btn-delete" class="icon-btn" title="Borrar (Supr)">🗑️</button>
+            </div>
+
+            <div class="topbar-separator"></div>
+
             <div class="topbar-section print-tools">
                 <button id="btn-add-page" class="icon-btn" title="Añadir Página (Layout)"><span style="display:inline-flex; align-items:center; justify-content:center; width:14px; height:18px; background:white; color:black; font-weight:bold; font-size:14px; border:1px solid #888; border-radius:2px; line-height:1;">+</span></button>
                 <button id="btn-print" class="icon-btn" title="Imprimir / Exportar a PDF">🖨️</button>
@@ -31,7 +39,8 @@
 
             <div class="topbar-section draw-tools">
                 <button id="tool-select" class="icon-btn tool-btn active" data-tool="select" title="Seleccionar">👆</button>
-                <button id="tool-move" class="icon-btn tool-btn" data-tool="move" title="Mover / Copiar">✥</button>
+                <button id="tool-move" class="icon-btn tool-btn" data-tool="move" title="Mover / Copiar">⇱</button>
+                <button id="tool-rotate" class="icon-btn tool-btn" data-tool="rotate" title="Rotar / Copiar">↻</button>
                 <button id="tool-polyline" class="icon-btn tool-btn" data-tool="polyline" title="Polilínea">📏</button>
                 <button id="tool-label" class="icon-btn tool-btn" data-tool="label" title="Etiqueta">T</button>
             </div>
@@ -57,22 +66,7 @@
         <div class="main-area">
             <!-- Sidebar / Properties -->
             <aside class="sidebar">
-                <div class="panel layers-panel">
-                    <h3>Capas</h3>
-                    <div class="add-layer-controls" style="display: flex; gap: 5px; margin-bottom: 10px;">
-                        <input type="text" id="new-layer-input" placeholder="Nueva capa..." style="flex: 1; padding: 4px; background: var(--bg-main); color: var(--text-main); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem;">
-                        <button id="btn-add-layer" class="btn primary" style="width: auto; padding: 4px 12px; margin: 0; font-size: 1.1rem; line-height: 1;">+</button>
-                    </div>
-                    <div id="layers-list">
-                        <!-- Las capas se inyectarán aquí dinámicamente -->
-                        <div class="layer-item active" data-layer="0">
-                            <span class="layer-color" style="background: #ffffff;"></span>
-                            <span class="layer-name">0 (Por defecto)</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="panel" id="properties-panel" style="display: none; border-top: 1px solid var(--border);">
+                <div class="panel" id="properties-panel" style="display: none; border-bottom: 1px solid var(--border);">
                     <h3>Propiedades</h3>
                     <div class="property-item">
                         <label>Objeto:</label>
@@ -97,7 +91,21 @@
                     <div class="property-item" id="prop-page-container" style="display: none; justify-content: center; margin-top: 10px;">
                         <button id="btn-edit-page" class="btn primary" style="width: 100%;">⚙️ Configurar Página</button>
                     </div>
-                    <button id="btn-delete" class="btn primary" style="background-color: #d9534f; margin-top: 10px; width: 100%;">Borrar (Papelera)</button>
+                </div>
+
+                <div class="panel layers-panel">
+                    <h3>Capas</h3>
+                    <div class="add-layer-controls" style="display: flex; gap: 5px; margin-bottom: 10px;">
+                        <input type="text" id="new-layer-input" placeholder="Nueva capa..." style="flex: 1; padding: 4px; background: var(--bg-main); color: var(--text-main); border: 1px solid var(--border); border-radius: 4px; font-size: 0.85rem;">
+                        <button id="btn-add-layer" class="btn primary" style="width: auto; padding: 4px 12px; margin: 0; font-size: 1.1rem; line-height: 1;">+</button>
+                    </div>
+                    <div id="layers-list">
+                        <!-- Las capas se inyectarán aquí dinámicamente -->
+                        <div class="layer-item active" data-layer="0">
+                            <span class="layer-color" style="background: #ffffff;"></span>
+                            <span class="layer-name">0 (Por defecto)</span>
+                        </div>
+                    </div>
                 </div>
             </aside>
 
@@ -318,6 +326,30 @@
                 <button id="layer-modal-cancel" class="btn" style="width: auto; background: var(--bg-main); color: var(--text-main);">Cancelar</button>
                 <button id="layer-modal-confirm" class="btn primary" style="width: auto;">Aceptar</button>
             </div>
+        </div>
+    </div>
+    
+    <!-- Time Map Panel -->
+    <div id="time-map-panel" class="time-map-collapsed">
+        <div id="time-map-header">
+            <span style="font-size: 0.9rem; font-weight: 600;">Multiverso (Mapa Temporal)</span>
+            <div style="display: flex; gap: 10px;">
+                <button id="btn-toggle-oracle" class="btn" style="padding: 4px 10px; font-size: 0.8rem; width: auto; height: auto; min-height: 24px; display: flex; align-items: center; gap: 5px; background: #333; color: white;" title="Ver Fantasmas del Futuro">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                        <circle cx="12" cy="12" r="3"></circle>
+                    </svg> Oráculo
+                </button>
+                <button id="btn-tag-node" class="btn primary" style="padding: 4px 10px; font-size: 0.8rem; width: auto; height: auto; min-height: 24px;">Etiquetar Momento</button>
+                <button id="time-map-toggle" title="Mostrar/Ocultar" style="background: none; border: none; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center;">
+                    <svg id="time-map-toggle-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="18 15 12 9 6 15"></polyline>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div id="time-map-body">
+            <svg id="time-map-svg" width="100%" height="100%"></svg>
         </div>
     </div>
     
