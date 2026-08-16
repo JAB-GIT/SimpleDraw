@@ -339,11 +339,14 @@ document.getElementById('page-modal-confirm').addEventListener('click', () => {
 
 // Print Modal
 btnPrint.addEventListener('click', () => {
+    const selPageObj = selectedObjects.find(o => o.type === 'page');
+    const selectedPageIdx = selPageObj ? selPageObj.index : -1;
+
     document.getElementById('print-selection').innerHTML = '';
     const sel = document.getElementById('print-selection');
     sel.innerHTML += `<option value="all">Todas (${pages.length})</option>`;
-    if (selectedPageIdx >= 0) {
-        sel.innerHTML += `<option value="${selectedPageIdx}">Seleccionada: ${pages[selectedPageIdx].name}</option>`;
+    if (selectedPageIdx >= 0 && pages[selectedPageIdx]) {
+        sel.innerHTML += `<option value="selected">Seleccionada: ${pages[selectedPageIdx].name}</option>`;
     }
     pages.forEach((p, i) => {
         sel.innerHTML += `<option value="${i}">${p.name}</option>`;
@@ -1723,6 +1726,12 @@ canvas.addEventListener('wheel', (e) => {
 document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
+    if (e.ctrlKey && e.key.toLowerCase() === 'p') {
+        e.preventDefault();
+        btnPrint.click();
+        return;
+    }
+
     if (e.ctrlKey && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         if (timeMap.activeNodeId && timeMap.nodes[timeMap.activeNodeId]) {
@@ -2670,13 +2679,23 @@ async function generatePDF() {
     const isMultiple = document.getElementById('print-mode').value === 'multiple';
     const namePattern = document.getElementById('print-filename').value;
     
+    const selPageObj = selectedObjects.find(o => o.type === 'page');
+    const selectedPageIdx = selPageObj ? selPageObj.index : -1;
+
     let pagesToPrint = [];
     if (selOpt === 'all') {
         pagesToPrint = pages;
     } else if (selOpt === 'selected') {
-        if (selectedPageIdx >= 0) pagesToPrint = [pages[selectedPageIdx]];
+        if (selectedPageIdx >= 0 && pages[selectedPageIdx]) {
+            pagesToPrint = [pages[selectedPageIdx]];
+        } else if (pages.length > 0) {
+            pagesToPrint = [pages[0]];
+        }
     } else {
-        pagesToPrint = [pages[parseInt(selOpt)]];
+        const idx = parseInt(selOpt);
+        if (!isNaN(idx) && pages[idx]) {
+            pagesToPrint = [pages[idx]];
+        }
     }
     
     if (pagesToPrint.length === 0) {
@@ -2693,8 +2712,9 @@ async function generatePDF() {
     for (let i = 0; i < pagesToPrint.length; i++) {
         const p = pagesToPrint[i];
         const formats = { 'A4': [210, 297], 'A3': [297, 420], 'A2': [420, 594], 'A1': [594, 841], 'A0': [841, 1189] };
-        let w_mm = formats[p.format][0];
-        let h_mm = formats[p.format][1];
+        const fmt = formats[p.format] || formats['A4'];
+        let w_mm = fmt[0];
+        let h_mm = fmt[1];
         let orient = p.orient === 'landscape' ? 'l' : 'p';
         if (orient === 'l') { const t = w_mm; w_mm = h_mm; h_mm = t; }
         
@@ -2704,8 +2724,8 @@ async function generatePDF() {
             pdf.addPage(p.format.toLowerCase(), orient);
         }
         
-        offCanvas.width = w_mm * DPI_SCALE;
-        offCanvas.height = h_mm * DPI_SCALE;
+        offCanvas.width = Math.round(w_mm * DPI_SCALE);
+        offCanvas.height = Math.round(h_mm * DPI_SCALE);
         
         const dim = getPageWorldDimensions(p);
         const tl = getPageTopLeft(p);
@@ -2719,7 +2739,7 @@ async function generatePDF() {
         
         // 1. Background & Border
         if (p.showBg) {
-            offCtx.fillStyle = p.bgColor;
+            offCtx.fillStyle = p.bgColor || '#ffffff';
             offCtx.fillRect(0, 0, offCanvas.width, offCanvas.height);
         }
         if (p.showBorder) {
@@ -2747,7 +2767,7 @@ async function generatePDF() {
         if (p.margins.l.show) { offCtx.beginPath(); offCtx.moveTo(ml, mt); offCtx.lineTo(ml, sph - mb); offCtx.stroke(); }
         if (p.margins.r.show) { offCtx.beginPath(); offCtx.moveTo(spw - mr, mt); offCtx.lineTo(spw - mr, sph - mb); offCtx.stroke(); }
         
-        offCtx.fillStyle = isColor ? '#000000' : '#000000';
+        offCtx.fillStyle = '#000000';
         const mmToScreen = 1 * mu * p.scale * tempScale;
         offCtx.font = `${5 * mmToScreen}px Inter`;
         const footerY = sph - mb + (1 * mmToScreen);
@@ -2758,7 +2778,7 @@ async function generatePDF() {
         offCtx.textAlign = 'right'; offCtx.fillText(parseVars(p.footR, p), spw - mr, footerY);
         offCtx.textBaseline = 'alphabetic';
 
-        // 3. Geometry (Polylines, Labels)
+        // 3. Geometry (Polylines)
         for (let j = 0; j < polylines.length; j++) {
             const pl = polylines[j];
             const layerData = layers[pl.layer];
@@ -2767,14 +2787,37 @@ async function generatePDF() {
             offCtx.strokeStyle = isColor ? layerData.color : '#000000';
             offCtx.lineWidth = 1 * DPI_SCALE / 2;
             offCtx.beginPath();
-            for (let k = 0; k < pl.points.length; k++) {
-                const sp = offWorldToScreen(pl.points[k].x, pl.points[k].y);
-                if (k === 0) offCtx.moveTo(sp.x, sp.y); else offCtx.lineTo(sp.x, sp.y);
+            if (pl.points.length > 0) {
+                const sp0 = offWorldToScreen(pl.points[0].x, pl.points[0].y);
+                offCtx.moveTo(sp0.x, sp0.y);
+                for (let k = 0; k < pl.points.length; k++) {
+                    let nextIdx = k + 1;
+                    if (nextIdx === pl.points.length) {
+                        if (pl.closed && pl.points.length > 2) nextIdx = 0;
+                        else continue;
+                    }
+                    const p1 = pl.points[k];
+                    const p2 = pl.points[nextIdx];
+                    if (p1.bulge && p1.bulge !== 0) {
+                        const arc = getArcParams(p1, p2, p1.bulge);
+                        if (arc) {
+                            const scx = offWorldToScreen(arc.cx, arc.cy);
+                            offCtx.arc(scx.x, scx.y, arc.R * tempScale, -arc.startAngle, -arc.endAngle, arc.ccw);
+                        } else {
+                            const sp2 = offWorldToScreen(p2.x, p2.y);
+                            offCtx.lineTo(sp2.x, sp2.y);
+                        }
+                    } else {
+                        const sp2 = offWorldToScreen(p2.x, p2.y);
+                        offCtx.lineTo(sp2.x, sp2.y);
+                    }
+                }
             }
             if (pl.closed && pl.points.length > 2) offCtx.closePath();
             offCtx.stroke();
         }
         
+        // 4. Geometry (Labels)
         for (let j = 0; j < labels.length; j++) {
             const lbl = labels[j];
             const layerData = layers[lbl.layer || '0'];
@@ -2783,7 +2826,7 @@ async function generatePDF() {
             const midX = segData.midX; const midY = segData.midY;
             const sp = offWorldToScreen(midX, midY);
             let prec = lbl.precision !== undefined ? lbl.precision : (documentSettings.lblPrecision !== undefined ? documentSettings.lblPrecision : 2);
-            let text = lbl.text.replace('#longitud#', segData.len.toFixed(prec)); text = text.replace('#capa#', segData.layer);
+            let text = lbl.text.replace('#longitud#', segData.len.toFixed(prec)).replace('#capa#', segData.layer);
             const sp1 = offWorldToScreen(segData.p1.x, segData.p1.y); const sp2 = offWorldToScreen(segData.p2.x, segData.p2.y);
             let angle = Math.atan2(sp2.y - sp1.y, sp2.x - sp1.x);
             if (angle > Math.PI/2 || angle < -Math.PI/2) angle += Math.PI;
@@ -2803,15 +2846,18 @@ async function generatePDF() {
         pdf.addImage(imgData, 'PNG', 0, 0, w_mm, h_mm);
         
         if (isMultiple) {
-            let filename = parseVars(namePattern, p) + ".pdf";
-            pdf.save(filename);
+            let fname = parseVars(namePattern, p);
+            if (!fname || fname.trim() === '') fname = p.name;
+            pdf.save(fname + ".pdf");
         }
     }
     
     if (!isMultiple) {
-        let filename = parseVars(namePattern, pagesToPrint[0]);
-        if (pagesToPrint.length > 1) filename = parseVars(documentSettings.projNum + "_Plano", pagesToPrint[0]);
-        pdf.save(filename + ".pdf");
+        let fname = parseVars(namePattern, pagesToPrint[0]);
+        if (!fname || fname.trim() === '') {
+            fname = (documentSettings.fileName || 'Dibujo') + '_Plano';
+        }
+        pdf.save(fname + ".pdf");
     }
 }
 
